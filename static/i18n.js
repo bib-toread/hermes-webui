@@ -830,7 +830,7 @@ const LOCALES = {
     provider_quota_pool_summary_checked: '{0} checked',
     // Custom relays / OpenAI-compatible 中转端点
     custom_relays_title: 'Custom Relays',
-    custom_relays_meta: 'OpenAI-compatible relay endpoints (CLI Proxy API, LiteLLM, OneAPI, …). Keys stored in ~/.hermes/.env, endpoints written to ~/.hermes/config.yaml custom_providers.',
+    custom_relays_meta: 'OpenAI-compatible relay endpoints (CLI Proxy API, LiteLLM, OneAPI, …). Keys stored in the active profile\'s .env (e.g. ~/.hermes/.env or ~/.hermes/profiles/<name>/.env); endpoints written to the active profile\'s config.yaml under custom_providers.',
     custom_relays_add: '+ Add Relay',
     custom_relays_empty: 'No custom relays configured.',
     custom_relays_new_title: 'New relay',
@@ -7481,7 +7481,7 @@ const LOCALES = {
     provider_quota_pool_summary_checked: '已检查 {0} 个',
     // 自定义中转端点
     custom_relays_title: '自定义中转',
-    custom_relays_meta: 'OpenAI 兼容的中转端点（CLI Proxy API、LiteLLM、OneAPI 等）。API Key 存入 ~/.hermes/.env，端点配置写入 ~/.hermes/config.yaml 的 custom_providers。',
+    custom_relays_meta: 'OpenAI 兼容的中转端点（CLI Proxy API、LiteLLM、OneAPI 等）。API Key 存入当前 profile 的 .env（如 ~/.hermes/.env 或 ~/.hermes/profiles/<name>/.env），端点配置写入对应 profile 的 config.yaml 的 custom_providers。',
     custom_relays_add: '+ 新增中转',
     custom_relays_empty: '暂无自定义中转。',
     custom_relays_new_title: '新建中转',
@@ -9009,7 +9009,7 @@ const LOCALES = {
     provider_quota_pool_summary_failed: '{0} 個失敗',
     provider_quota_pool_summary_checked: '已檢查 {0} 個',
     custom_relays_title: '自訂中轉',
-    custom_relays_meta: 'OpenAI 相容的中轉端點（CLI Proxy API、LiteLLM、OneAPI 等）。金鑰存於 ~/.hermes/.env，端點寫入 ~/.hermes/config.yaml 的 custom_providers。',
+    custom_relays_meta: 'OpenAI 相容的中轉端點（CLI Proxy API、LiteLLM、OneAPI 等）。金鑰存於目前 profile 的 .env（例如 ~/.hermes/.env 或 ~/.hermes/profiles/<name>/.env），端點寫入對應 profile 的 config.yaml 的 custom_providers。',
     custom_relays_add: '+ 新增中轉',
     custom_relays_empty: '尚無自訂中轉。',
     custom_relays_new_title: '新增中轉',
