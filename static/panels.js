@@ -7283,16 +7283,18 @@ async function adminSyncSelectedSkills(){
         stat.textContent = `部分成功：${count} 个推送成功，${skipped.length} 个失败 — ${skipped.map(s => s.name || s).join(', ')}`;
       }
     }
-    // Clear selection so admin doesn't accidentally re-push.
+    // Clear selection so admin doesn't accidentally re-push. This calls
+    // _adminUpdateSyncSelectedCount() which already syncs the button
+    // label + disabled state — no need to redo it in the finally block.
     adminToggleAllSyncSkills(false);
   }catch(e){
     if(stat){
       stat.style.color = '#ff5b6f';
       stat.textContent = '推送失败：' + (e && e.message || e);
     }
-  }finally{
-    btn.disabled = (document.querySelectorAll('.admin-sync-skill-cb:checked').length === 0);
-    if(btn.disabled) btn.textContent = originalLabel.replace(/\d+/, '0');
+    // On failure, restore the button to its pre-click state so admin can retry.
+    btn.disabled = false;
+    btn.textContent = originalLabel;
   }
 }
 

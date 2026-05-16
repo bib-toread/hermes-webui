@@ -101,6 +101,12 @@ def sync_profile_skills_to_global(profile_name: str,
 
     Returns ``{synced: [<category/name or name>, ...], skipped: [...],
     count: N}``. Never raises; per-skill failures are caught + reported.
+
+    Serialized under ``_CASCADE_LOCK`` so two concurrent admins pushing
+    overlapping skills can't interleave their rmtree+copytree on the
+    SAME global skill dir (which would surface as FileExistsError /
+    FileNotFoundError for whoever lost the race). RLock from
+    api.global_config so existing snapshot+mirror flows can re-enter.
     """
     synced: list[str] = []
     skipped: list[dict] = []
@@ -114,44 +120,46 @@ def sync_profile_skills_to_global(profile_name: str,
         if not only_set:
             return {'synced': [], 'skipped': [], 'count': 0}
 
-    src = _resolve_profile_home_for_name(profile_name) / 'skills'
-    if not src.exists() or not src.is_dir():
-        # Source profile has no skills/ dir. If specific labels were
-        # requested, report them all as not-found so the caller knows
-        # the push silently dropped them.
+    from api.global_config import _CASCADE_LOCK
+    with _CASCADE_LOCK:
+        src = _resolve_profile_home_for_name(profile_name) / 'skills'
+        if not src.exists() or not src.is_dir():
+            # Source profile has no skills/ dir. If specific labels were
+            # requested, report them all as not-found so the caller knows
+            # the push silently dropped them.
+            if only_set is not None:
+                for missing in sorted(only_set):
+                    skipped.append({'name': missing, 'error': 'not found in source profile'})
+            return {'synced': [], 'skipped': skipped, 'count': 0}
+        dst_root = ensure_global_skills_dir()
+
+        seen_labels: set = set()
+
+        for entry in sorted(src.iterdir()):
+            if not entry.is_dir():
+                continue
+            # Direct skill at root: <skills>/<name>/SKILL.md
+            if (entry / 'SKILL.md').is_file():
+                label = entry.name
+                seen_labels.add(label)
+                if only_set is not None and label not in only_set:
+                    continue
+                _copy_skill(entry, dst_root / entry.name, label, synced, skipped)
+                continue
+            # Category dir: <skills>/<category>/<name>/SKILL.md
+            for sub in sorted(entry.iterdir()):
+                if not sub.is_dir() or not (sub / 'SKILL.md').is_file():
+                    continue
+                label = f"{entry.name}/{sub.name}"
+                seen_labels.add(label)
+                if only_set is not None and label not in only_set:
+                    continue
+                _copy_skill(sub, dst_root / entry.name / sub.name, label, synced, skipped)
+
+        # Report any requested labels that didn't exist in the source profile.
         if only_set is not None:
-            for missing in sorted(only_set):
+            for missing in sorted(only_set - seen_labels):
                 skipped.append({'name': missing, 'error': 'not found in source profile'})
-        return {'synced': [], 'skipped': skipped, 'count': 0}
-    dst_root = ensure_global_skills_dir()
-
-    seen_labels: set = set()
-
-    for entry in sorted(src.iterdir()):
-        if not entry.is_dir():
-            continue
-        # Direct skill at root: <skills>/<name>/SKILL.md
-        if (entry / 'SKILL.md').is_file():
-            label = entry.name
-            seen_labels.add(label)
-            if only_set is not None and label not in only_set:
-                continue
-            _copy_skill(entry, dst_root / entry.name, label, synced, skipped)
-            continue
-        # Category dir: <skills>/<category>/<name>/SKILL.md
-        for sub in sorted(entry.iterdir()):
-            if not sub.is_dir() or not (sub / 'SKILL.md').is_file():
-                continue
-            label = f"{entry.name}/{sub.name}"
-            seen_labels.add(label)
-            if only_set is not None and label not in only_set:
-                continue
-            _copy_skill(sub, dst_root / entry.name / sub.name, label, synced, skipped)
-
-    # Report any requested labels that didn't exist in the source profile.
-    if only_set is not None:
-        for missing in sorted(only_set - seen_labels):
-            skipped.append({'name': missing, 'error': 'not found in source profile'})
 
     return {'synced': synced, 'skipped': skipped, 'count': len(synced)}
 
@@ -162,12 +170,20 @@ def _copy_skill(src_dir: Path, dst_dir: Path, label: str,
 
     Always overwrites — that's the intent of "push to global". On any IO
     failure, records the skill in ``skipped`` with the error and moves on.
+
+    SECURITY: ``symlinks=True`` preserves symlinks as links rather than
+    following + copying targets. Otherwise a stray ``link → /etc`` inside
+    an admin's skill dir would have caused copytree to silently mirror
+    /etc (or any other arbitrary tree) into ~/.hermes/global/skills/.
+    With symlinks=True the link itself ends up in global; if it points
+    outside the skills tree, the agent reading it would fail at read
+    time — visible failure beats silent exfiltration.
     """
     try:
         if dst_dir.exists():
             shutil.rmtree(str(dst_dir))
         dst_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(str(src_dir), str(dst_dir))
+        shutil.copytree(str(src_dir), str(dst_dir), symlinks=True)
         synced.append(label)
     except Exception as exc:
         logger.exception("failed to sync skill %s → global", label)

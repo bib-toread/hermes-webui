@@ -333,6 +333,162 @@ class TestGetLastWorkspaceValidation(unittest.TestCase):
         self.assertEqual(str(Path(result).resolve()), str(registered.resolve()))
 
 
+class TestReasoningPerUser(unittest.TestCase):
+    """Regression: /api/reasoning POST is per-user, NOT admin-only.
+
+    The reasoning chip (None/Low/Medium/High in the composer) writes to
+    the active profile's config.yaml. It MUST be writable by any logged-
+    in user — locking it admin-only used to silently 403 in the UI.
+    Guard against accidental re-locking by future review passes.
+    """
+
+    def setUp(self):
+        _reset()
+
+    def test_reasoning_endpoint_not_admin_gated(self):
+        """Static check: the /api/reasoning POST handler must NOT call
+        _admin_or_403 (which would 403 non-admin users)."""
+        import api.routes as routes_mod
+        import inspect
+        src = inspect.getsource(routes_mod.handle_post)
+        # Find the /api/reasoning block specifically.
+        i = src.find('"/api/reasoning"')
+        self.assertGreater(i, -1, "/api/reasoning handler not found")
+        # Look at the next 1500 chars (handler body is ~30 lines).
+        block = src[i:i + 1500]
+        self.assertNotIn(
+            '_admin_or_403', block,
+            "/api/reasoning was admin-locked again — that breaks the "
+            "reasoning chip for non-admin users. Reasoning effort is a "
+            "per-user preference, not a system setting."
+        )
+
+    def test_reasoning_endpoint_does_not_cascade(self):
+        """Static check: must NOT call _mirror_global_config_after_admin_write
+        (which would push the user's choice to every other user's profile).
+        Comment lines are filtered out so the explanatory ``# No _mirror...()``
+        in the handler docs doesn't trip the assertion."""
+        import api.routes as routes_mod
+        import inspect
+        src = inspect.getsource(routes_mod.handle_post)
+        i = src.find('"/api/reasoning"')
+        self.assertGreater(i, -1)
+        block = src[i:i + 1500]
+        # Strip comments — only code lines count.
+        code_only = '\n'.join(
+            line for line in block.splitlines()
+            if not line.lstrip().startswith('#')
+        )
+        self.assertNotIn(
+            '_mirror_global_config_after_admin_write(', code_only,
+            "/api/reasoning is per-user; cascading would bleed one user's "
+            "reasoning choice into every other user's profile."
+        )
+
+
+class TestSyncSkillsConcurrency(unittest.TestCase):
+    """sync_profile_skills_to_global must hold _CASCADE_LOCK to serialize
+    overlapping admin pushes — otherwise two admins pushing the same
+    skill at the same time race on rmtree+copytree."""
+
+    def setUp(self):
+        _reset()
+        self.user = users.create_user('synctest', 'pw1234', role='admin',
+                                       profile_name='user_synctest')
+        from api.profiles import _resolve_profile_home_for_name
+        self.profile_home = _resolve_profile_home_for_name('user_synctest')
+        skills_dir = self.profile_home / 'skills' / 'shared'
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        (skills_dir / 'SKILL.md').write_text('# shared', encoding='utf-8')
+
+    def test_concurrent_pushes_serialize_cleanly(self):
+        """Two threads pushing the same skill must both report success
+        (the lock makes the second wait for the first)."""
+        from api.global_skills import sync_profile_skills_to_global, global_skills_dir
+        import threading
+
+        results = []
+        errors = []
+
+        def push():
+            try:
+                r = sync_profile_skills_to_global('user_synctest', only=['shared'])
+                results.append(r)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=push) for _ in range(6)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        self.assertEqual(errors, [], f"sync raised under concurrency: {errors}")
+        # All 6 should have count=1 with no skipped — the lock serializes
+        # the rmtree+copytree so each one sees a clean dst.
+        for r in results:
+            self.assertEqual(r['count'], 1, f"got partial result: {r}")
+            self.assertEqual(r['skipped'], [])
+        # Final state: the skill exists in global.
+        gdir = global_skills_dir()
+        self.assertTrue((gdir / 'shared' / 'SKILL.md').exists())
+
+
+class TestSyncSkillsSymlinkSafety(unittest.TestCase):
+    """_copy_skill uses symlinks=True so a stray symlink inside an admin's
+    skill dir is copied AS a link, not followed + mirrored. Prevents
+    arbitrary tree exfiltration if a malicious or accidental
+    `link → /etc` exists in a skill subdir."""
+
+    def setUp(self):
+        _reset()
+        self.user = users.create_user('symtest', 'pw1234', role='admin',
+                                       profile_name='user_symtest')
+        from api.profiles import _resolve_profile_home_for_name
+        self.profile_home = _resolve_profile_home_for_name('user_symtest')
+
+    def test_symlinks_preserved_not_followed(self):
+        import os
+        # Windows symlink creation requires special privileges; skip there.
+        if os.name == 'nt':
+            self.skipTest("symlink creation requires admin on Windows")
+        from api.global_skills import sync_profile_skills_to_global, global_skills_dir
+        import tempfile
+        # Plant a "secret" dir we don't want exfiltrated, then symlink to it
+        # from inside a skill subdir.
+        secret = Path(tempfile.mkdtemp(prefix='hermes_sym_secret_'))
+        (secret / 'top-secret.txt').write_text('CLASSIFIED', encoding='utf-8')
+        try:
+            skill_dir = self.profile_home / 'skills' / 'has-symlink'
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / 'SKILL.md').write_text('# normal', encoding='utf-8')
+            (skill_dir / 'evil-link').symlink_to(str(secret))
+
+            sync_profile_skills_to_global('user_symtest', only=['has-symlink'])
+
+            gdir = global_skills_dir() / 'has-symlink'
+            link = gdir / 'evil-link'
+            # The link should be preserved AS a link, NOT followed +
+            # copied. So global/has-symlink/evil-link should be a symlink,
+            # and top-secret.txt should NOT be physically copied under it.
+            self.assertTrue(link.is_symlink(),
+                            "expected symlink to be preserved as-is, not followed")
+            # Critically: top-secret.txt is NOT a real file in the global
+            # tree. (It's reachable via the link, but if the link is later
+            # broken, no data leaks.)
+            import os as _os
+            file_in_global = gdir / 'evil-link' / 'top-secret.txt'
+            # The path resolves THROUGH the symlink; we want to assert no
+            # FILE was actually copied. Check by removing the original
+            # secret dir → file_in_global should become unreachable.
+            import shutil
+            shutil.rmtree(str(secret), ignore_errors=True)
+            self.assertFalse(file_in_global.exists(),
+                "top-secret.txt was physically copied into global — "
+                "symlink was FOLLOWED instead of preserved")
+        finally:
+            import shutil
+            shutil.rmtree(str(secret), ignore_errors=True)
+
+
 class TestQuotaGateFailureLogging(unittest.TestCase):
 
     def setUp(self):
