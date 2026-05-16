@@ -4935,25 +4935,26 @@ def handle_post(handler, parsed) -> bool:
         #   {"display": "show"|"hide"|"on"|"off"}   → display.show_reasoning
         #   {"effort":  "none"|"minimal"|"low"|"medium"|"high"|"xhigh"}
         #                                            → agent.reasoning_effort
-        if not _admin_or_403(handler):
-            return True
+        #
+        # Per-user preference, NOT a global system setting: reasoning effort
+        # is a speed/quality knob each user should be able to tweak per
+        # conversation. Writes only to the request-thread's active profile
+        # config.yaml so one user's choice doesn't bleed into another's.
+        # No _mirror_global_config_after_admin_write() — that would cascade
+        # the user's pick to every other user's profile. (#fix: reasoning
+        # chip was 403'ing for non-admins.)
         try:
             display = body.get("display")
             effort = body.get("effort")
             if display is not None:
                 flag = str(display).strip().lower()
                 if flag in ("show", "on", "true", "1"):
-                    result = set_reasoning_display(True)
-                elif flag in ("hide", "off", "false", "0"):
-                    result = set_reasoning_display(False)
-                else:
-                    return bad(handler, f"display must be show|hide|on|off (got '{display}')")
-                _mirror_global_config_after_admin_write()
-                return j(handler, result)
+                    return j(handler, set_reasoning_display(True))
+                if flag in ("hide", "off", "false", "0"):
+                    return j(handler, set_reasoning_display(False))
+                return bad(handler, f"display must be show|hide|on|off (got '{display}')")
             if effort is not None:
-                result = set_reasoning_effort(effort)
-                _mirror_global_config_after_admin_write()
-                return j(handler, result)
+                return j(handler, set_reasoning_effort(effort))
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
         except ValueError as e:
             return bad(handler, str(e))
