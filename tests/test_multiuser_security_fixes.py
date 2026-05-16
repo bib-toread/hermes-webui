@@ -249,6 +249,90 @@ class TestDeleteAdminUsersGate(unittest.TestCase):
 # bug_039: quota-gate failure logs at WARNING with dedup
 # ──────────────────────────────────────────────────────────────────────
 
+class TestGetLastWorkspaceValidation(unittest.TestCase):
+    """get_last_workspace must validate last_workspace.txt against the
+    profile's workspaces.json — paths NOT in the registered list must be
+    treated as stale and fall back to the first registered entry.
+    Regression test for the bug where /root/workspace leaked into a
+    user's per-profile last_workspace.txt and stuck around forever.
+    """
+
+    def setUp(self):
+        _reset()
+        # Create a user so there's an active profile (via thread-local later
+        # we use the on-disk file paths directly to avoid the full TLS dance).
+        self.user = users.create_user('lwtest', 'pw1234', role='user',
+                                       profile_name='user_lwtest')
+
+    def test_stale_last_workspace_falls_back_to_first_registered(self):
+        """When last_workspace.txt points outside workspaces.json, the
+        getter must drop that path and return the first registered
+        workspace instead."""
+        import tempfile, shutil
+        # Build a fake on-disk profile state dir layout the workspace helper
+        # will discover via api.profiles.get_active_hermes_home().
+        from api.profiles import _resolve_profile_home_for_name
+        profile_home = _resolve_profile_home_for_name('user_lwtest')
+        ws_dir = profile_home / 'webui_state'
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        registered = profile_home / 'workspace'
+        registered.mkdir(parents=True, exist_ok=True)
+        # Stranger path that exists but is NOT in workspaces.json
+        stranger = Path(tempfile.mkdtemp(prefix='hermes_stranger_'))
+        try:
+            # workspaces.json only lists the per-profile workspace
+            import json
+            (ws_dir / 'workspaces.json').write_text(
+                json.dumps([{'name': 'Home', 'path': str(registered.resolve())}]),
+                encoding='utf-8',
+            )
+            # last_workspace.txt points at the stranger — should be ignored
+            (ws_dir / 'last_workspace.txt').write_text(
+                str(stranger.resolve()), encoding='utf-8',
+            )
+            # Bind the profile so the workspace helper resolves to ours
+            from api.profiles import set_request_profile, clear_request_profile
+            set_request_profile('user_lwtest')
+            try:
+                from api.workspace import get_last_workspace
+                result = get_last_workspace()
+            finally:
+                clear_request_profile()
+            self.assertEqual(
+                str(Path(result).resolve()),
+                str(registered.resolve()),
+                f"stale last_workspace={stranger!r} should fall back to "
+                f"registered Home={registered!r}, got {result!r}",
+            )
+        finally:
+            shutil.rmtree(str(stranger), ignore_errors=True)
+
+    def test_registered_last_workspace_returns_unchanged(self):
+        """When last_workspace.txt IS in workspaces.json, it's returned as-is."""
+        from api.profiles import _resolve_profile_home_for_name
+        profile_home = _resolve_profile_home_for_name('user_lwtest')
+        ws_dir = profile_home / 'webui_state'
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        registered = profile_home / 'workspace'
+        registered.mkdir(parents=True, exist_ok=True)
+        import json
+        (ws_dir / 'workspaces.json').write_text(
+            json.dumps([{'name': 'Home', 'path': str(registered.resolve())}]),
+            encoding='utf-8',
+        )
+        (ws_dir / 'last_workspace.txt').write_text(
+            str(registered.resolve()), encoding='utf-8',
+        )
+        from api.profiles import set_request_profile, clear_request_profile
+        set_request_profile('user_lwtest')
+        try:
+            from api.workspace import get_last_workspace
+            result = get_last_workspace()
+        finally:
+            clear_request_profile()
+        self.assertEqual(str(Path(result).resolve()), str(registered.resolve()))
+
+
 class TestQuotaGateFailureLogging(unittest.TestCase):
 
     def setUp(self):

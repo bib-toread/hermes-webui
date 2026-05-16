@@ -32,7 +32,9 @@ update — that's the "立即生效" guarantee the operator asked for.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import tempfile
 import threading
 from pathlib import Path
 
@@ -43,7 +45,36 @@ logger = logging.getLogger(__name__)
 # Serializes snapshot+mirror so two concurrent admin writes can't interleave
 # (admin A snapshots while admin B is still copying → mixed state). Held only
 # for the duration of file IO, which is fast; admin endpoints are low-QPS.
-_CASCADE_LOCK = threading.Lock()
+# Also wraps the entire read-modify-write of global config files (e.g.
+# set_output_language) so the in-memory RMW + on-disk mirror runs as a
+# single serialized critical section. (#review-fix bug_034: lock around RMW)
+_CASCADE_LOCK = threading.RLock()
+
+
+def _atomic_write_text(path: Path, content: str, *, mode: int | None = None) -> None:
+    """Write *content* to *path* atomically via tempfile + os.replace.
+
+    Prevents the half-truncated-file failure mode where a crash mid-write
+    leaves a config.yaml that the agent can't parse on next startup.
+    (#review-fix: was using plain write_text on operator-facing config.)
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        if mode is not None:
+            try:
+                os.chmod(tmp, mode)
+            except OSError:
+                pass
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 # Top-level keys in config.yaml that are mirrored from global → per-user.
 # Anything outside this set in a user's profile config.yaml is preserved.
@@ -283,46 +314,55 @@ def set_output_language(lang: str) -> dict:
     except ImportError:
         raise RuntimeError("PyYAML is required to update agent config")
 
-    ensure_global_root()
-    cfg_file = global_config_yaml()
-    data: dict = {}
-    if cfg_file.exists():
-        try:
-            loaded = yaml.safe_load(cfg_file.read_text(encoding='utf-8'))
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception:
-            logger.warning("global config.yaml unreadable; overwriting", exc_info=True)
+    # Hold _CASCADE_LOCK across the entire read-modify-write-mirror block
+    # so two concurrent admins setting different languages can't interleave
+    # (A reads → B reads → A writes → B writes → A mirrors with B's data → B
+    # mirrors with stale-A data). RLock is the same lock cascade_from_admin
+    # uses below; reentrancy lets mirror_global_to_all_users acquire freely.
+    with _CASCADE_LOCK:
+        ensure_global_root()
+        cfg_file = global_config_yaml()
+        data: dict = {}
+        if cfg_file.exists():
+            try:
+                loaded = yaml.safe_load(cfg_file.read_text(encoding='utf-8'))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                logger.warning("global config.yaml unreadable; overwriting", exc_info=True)
 
-    agent = data.get('agent') if isinstance(data.get('agent'), dict) else {}
-    personalities = agent.get('personalities') if isinstance(agent.get('personalities'), dict) else {}
+        agent = data.get('agent') if isinstance(data.get('agent'), dict) else {}
+        personalities = agent.get('personalities') if isinstance(agent.get('personalities'), dict) else {}
 
-    if lang == 'auto':
-        agent.pop('output_language', None)
-        personalities.pop(_OUTPUT_LANGUAGE_PERSONALITY, None)
-        prompt = ''
-    else:
-        agent['output_language'] = lang
-        prompt = _OUTPUT_LANGUAGE_PROMPTS[lang]
-        personalities[_OUTPUT_LANGUAGE_PERSONALITY] = {
-            'system_prompt': prompt,
-            'description': f"Global output language enforcement ({lang}). Auto-applied to every new session.",
-        }
+        if lang == 'auto':
+            agent.pop('output_language', None)
+            personalities.pop(_OUTPUT_LANGUAGE_PERSONALITY, None)
+            prompt = ''
+        else:
+            agent['output_language'] = lang
+            prompt = _OUTPUT_LANGUAGE_PROMPTS[lang]
+            personalities[_OUTPUT_LANGUAGE_PERSONALITY] = {
+                'system_prompt': prompt,
+                'description': f"Global output language enforcement ({lang}). Auto-applied to every new session.",
+            }
 
-    agent['personalities'] = personalities
-    data['agent'] = agent
+        agent['personalities'] = personalities
+        data['agent'] = agent
 
-    cfg_file.write_text(
-        yaml.dump(data, default_flow_style=False, allow_unicode=True),
-        encoding='utf-8',
-    )
+        # Atomic write: tempfile + os.replace so a crash mid-write doesn't
+        # leave a truncated config.yaml that breaks every user's agent on
+        # next start. (#review-fix bug_034 priority 2)
+        _atomic_write_text(
+            cfg_file,
+            yaml.dump(data, default_flow_style=False, allow_unicode=True),
+        )
 
-    # Cascade to every user profile so config.yaml.agent.{output_language,
-    # personalities._global_lang} are visible everywhere on the next chat
-    # turn. mirror_global_to_all_users() walks each profile and merges
-    # GLOBAL_CONFIG_KEYS (which includes 'agent'); we don't need a
-    # special-case here.
-    mirrored = mirror_global_to_all_users()
+        # Cascade to every user profile so config.yaml.agent.{output_language,
+        # personalities._global_lang} are visible everywhere on the next chat
+        # turn. mirror_global_to_all_users() walks each profile and merges
+        # GLOBAL_CONFIG_KEYS (which includes 'agent'); we don't need a
+        # special-case here.
+        mirrored = mirror_global_to_all_users()
     return {'lang': lang, 'mirrored': mirrored, 'prompt': prompt}
 
 

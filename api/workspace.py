@@ -295,12 +295,19 @@ def get_last_workspace() -> str:
         try:
             p = _GLOBAL_LW_FILE.read_text(encoding='utf-8').strip()
             if p and Path(p).is_dir():
-                resolved = str(Path(p).expanduser().resolve())
+                resolved_path = Path(p).expanduser().resolve()
+                resolved = str(resolved_path)
                 try:
                     from api.profiles import get_active_hermes_home
-                    own_dir = str(get_active_hermes_home().resolve())
-                    if resolved.startswith(own_dir):
+                    own_dir = get_active_hermes_home().resolve()
+                    # Path containment, NOT string prefix — startswith would
+                    # erroneously match `/x/own_foo` as inside `/x/own`.
+                    # (#review-fix bug_034 priority 1)
+                    try:
+                        resolved_path.relative_to(own_dir)
                         return resolved
+                    except ValueError:
+                        pass  # global path is outside our profile — ignore
                 except Exception:
                     return resolved  # best-effort if profile lookup fails
         except Exception:

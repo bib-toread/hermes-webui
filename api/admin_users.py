@@ -274,10 +274,13 @@ def _seed_terminal_cwd_in_config(config_yaml_path: Path, cwd: str) -> None:
     term['cwd'] = cwd
     data['terminal'] = term
     try:
-        config_yaml_path.parent.mkdir(parents=True, exist_ok=True)
-        config_yaml_path.write_text(
+        # Atomic write so a crash mid-write doesn't truncate the user's
+        # config.yaml — the agent reads this on every chat turn.
+        # (#review-fix bug_034: atomic write for operator-facing config)
+        from api.global_config import _atomic_write_text
+        _atomic_write_text(
+            config_yaml_path,
             _yaml.dump(data, default_flow_style=False, allow_unicode=True),
-            encoding='utf-8',
         )
     except OSError:
         logger.debug("failed to write %s", config_yaml_path, exc_info=True)
