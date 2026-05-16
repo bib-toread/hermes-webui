@@ -1,6 +1,12 @@
 """
 Tests for auth session lifecycle — session creation, verification, expiry,
 and lazy pruning of expired entries.
+
+Multi-user note: as of the multi-user refactor the session payload is
+``{'user_id': int | None, 'exp': float}`` rather than a bare float. These
+tests use the ``_entry()`` helper below to construct payloads in the new
+shape; legacy bare-float entries are intentionally dropped on load and
+treated as expired by ``_prune_expired_sessions``.
 """
 import time
 import unittest
@@ -21,6 +27,11 @@ import importlib
 auth = importlib.import_module("api.auth")
 
 
+def _entry(exp_ts, user_id=None):
+    """Build a session payload in the multi-user dict shape."""
+    return {'user_id': user_id, 'exp': float(exp_ts)}
+
+
 class TestSessionPruning(unittest.TestCase):
     """Verify expired session cleanup works correctly."""
 
@@ -36,10 +47,10 @@ class TestSessionPruning(unittest.TestCase):
     def test_expired_session_pruned(self):
         """Manually inserting an expired entry should be pruned on next verify_session call."""
         # Insert sessions that have already expired
-        auth._sessions["fake_token"] = time.time() - 100
-        auth._sessions["another_fake"] = time.time() - 50
+        auth._sessions["fake_token"] = _entry(time.time() - 100)
+        auth._sessions["another_fake"] = _entry(time.time() - 50)
         # Insert one valid session (far future)
-        auth._sessions["good_token"] = time.time() + 3600
+        auth._sessions["good_token"] = _entry(time.time() + 3600)
 
         # _sessions has 3 entries, 2 expired
         self.assertEqual(len(auth._sessions), 3)
@@ -56,9 +67,9 @@ class TestSessionPruning(unittest.TestCase):
 
     def test_prune_does_not_remove_valid_sessions(self):
         """_prune_expired_sessions should never remove sessions that are still active."""
-        auth._sessions["active_1"] = time.time() + 86400  # 24 hours from now
-        auth._sessions["active_2"] = time.time() + 7200    # 2 hours from now
-        auth._sessions["expired_1"] = time.time() - 10
+        auth._sessions["active_1"] = _entry(time.time() + 86400)  # 24 hours from now
+        auth._sessions["active_2"] = _entry(time.time() + 7200)    # 2 hours from now
+        auth._sessions["expired_1"] = _entry(time.time() - 10)
 
         auth._prune_expired_sessions()
 
@@ -73,7 +84,7 @@ class TestSessionPruning(unittest.TestCase):
         This ensures that _prune_expired_sessions() is called at the very top
         of verify_session(), so cleanup happens on every auth check.
         """
-        auth._sessions["expired_for_test"] = time.time() - 999
+        auth._sessions["expired_for_test"] = _entry(time.time() - 999)
 
         # verify_session with an invalid cookie triggers the full path:
         # _prune_expired_sessions -> signature check -> return False
@@ -93,19 +104,13 @@ class TestSessionPruning(unittest.TestCase):
         """Newly created sessions should have the expected 24-hour TTL."""
         auth._sessions.clear()
         token_hex = auth.create_session().split(".")[0]
-        # The _sessions dict stores token -> expiry_time
-        # We can check the expiry is approximately SESSION_TTL seconds from now
-        # by looking up the raw entry via the token
+        # The _sessions dict stores token -> {'user_id', 'exp'} (multi-user shape)
         from api.auth import _sessions, SESSION_TTL
-        # find our entry
-        for t, exp in _sessions.items():
-            if t == token_hex:
-                # expiry should be within 5 seconds of now + SESSION_TTL
-                expected = time.time() + SESSION_TTL
-                self.assertAlmostEqual(exp, expected, delta=5)
-                break
-        else:
-            self.fail("Session token not found in _sessions")
+        payload = _sessions.get(token_hex)
+        self.assertIsNotNone(payload, "Session token not found in _sessions")
+        self.assertIsInstance(payload, dict)
+        expected = time.time() + SESSION_TTL
+        self.assertAlmostEqual(payload['exp'], expected, delta=5)
 
 
 class TestSessionInvalidation(unittest.TestCase):
@@ -153,7 +158,7 @@ class TestHmacMigrationBridge(unittest.TestCase):
         this cookie must still be accepted (migration bridge).
         """
         token = auth.secrets.token_hex(32)
-        auth._sessions[token] = time.time() + 3600
+        auth._sessions[token] = _entry(time.time() + 3600)
         legacy_sig = auth.hmac.new(
             auth._signing_key(), token.encode(), auth.hashlib.sha256
         ).hexdigest()[:32]
@@ -167,7 +172,7 @@ class TestHmacMigrationBridge(unittest.TestCase):
         arbitrary short signatures.
         """
         token = auth.secrets.token_hex(32)
-        auth._sessions[token] = time.time() + 3600
+        auth._sessions[token] = _entry(time.time() + 3600)
         forged = "a" * 32
         self.assertFalse(auth.verify_session(f"{token}.{forged}"))
 
@@ -245,12 +250,10 @@ class TestSessionTtlResolution(unittest.TestCase):
         os.environ["HERMES_WEBUI_SESSION_TTL"] = "3600"
         token_hex = auth.create_session().split(".")[0]
         from api.auth import _sessions
-        for t, exp in _sessions.items():
-            if t == token_hex:
-                # The resolved env-var value (3600s) should be applied, not
-                # the SESSION_TTL fallback default.
-                expected = time.time() + 3600
-                self.assertAlmostEqual(exp, expected, delta=5)
-                break
-        else:
-            self.fail("Session token not found in _sessions")
+        payload = _sessions.get(token_hex)
+        self.assertIsNotNone(payload, "Session token not found in _sessions")
+        self.assertIsInstance(payload, dict)
+        # The resolved env-var value (3600s) should be applied, not
+        # the SESSION_TTL fallback default.
+        expected = time.time() + 3600
+        self.assertAlmostEqual(payload['exp'], expected, delta=5)
