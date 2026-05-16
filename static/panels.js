@@ -7526,6 +7526,25 @@ function adminApplyRoleVisibility(user){
     const dd = document.getElementById('profileDropdown');
     if(dd) dd.style.display = 'none';
   }
+  // Settings sidebar user card — shown for every logged-in user so even
+  // regular users (who don't see the System tab) have a sign-out path.
+  // The card displays the active user's name + role + a sign-out button
+  // wired to the existing global signOut() function.
+  const card = document.getElementById('settingsUserCard');
+  if(card){
+    if(isMultiUser){
+      const nameEl = document.getElementById('settingsUserCardName');
+      const roleEl = document.getElementById('settingsUserCardRole');
+      const avatarEl = document.getElementById('settingsUserCardAvatar');
+      const uname = (user.username || '').toString();
+      if(nameEl) nameEl.textContent = uname;
+      if(roleEl) roleEl.textContent = isAdmin ? '管理员' : '用户';
+      if(avatarEl) avatarEl.textContent = uname.charAt(0).toUpperCase() || '?';
+      card.hidden = false;
+    } else {
+      card.hidden = true;
+    }
+  }
 }
 
 // Run after DOM is ready; the script is loaded at the end of <body> so DOM is
