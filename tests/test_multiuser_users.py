@@ -340,5 +340,68 @@ class TestProfileReverseLookup(unittest.TestCase):
         self.assertIsNone(users.get_user_by_profile_name('user_ghost'))
 
 
+class TestSeedDefaultWorkspace(unittest.TestCase):
+    """admin_users._seed_default_workspace pre-populates a new user's
+    profile with a default workspace pointer so first login lands them
+    in their own isolated workspace (not the process-global DEFAULT).
+    """
+
+    def setUp(self):
+        users.ensure_schema()
+        _reset_db()
+        # Build the same per-profile dir layout create_profile_api would.
+        # Wipe any leftovers from a prior test so workspaces.json starts
+        # absent (the helper is intentionally non-destructive when the
+        # file already exists; that's covered by a dedicated test).
+        import shutil
+        from api.profiles import _resolve_profile_home_for_name
+        self.profile_home = _resolve_profile_home_for_name('user_seedtest')
+        if self.profile_home.exists():
+            shutil.rmtree(str(self.profile_home), ignore_errors=True)
+        (self.profile_home / 'workspace').mkdir(parents=True, exist_ok=True)
+
+    def test_writes_last_workspace_pointer(self):
+        from api.admin_users import _seed_default_workspace
+        _seed_default_workspace('user_seedtest')
+        lw = self.profile_home / 'webui_state' / 'last_workspace.txt'
+        self.assertTrue(lw.exists())
+        # Should point at the profile's own workspace dir, resolved.
+        self.assertEqual(
+            lw.read_text(encoding='utf-8').strip(),
+            str((self.profile_home / 'workspace').resolve()),
+        )
+
+    def test_writes_workspaces_json_with_one_entry(self):
+        from api.admin_users import _seed_default_workspace
+        _seed_default_workspace('user_seedtest', display_name='Home (seedtest)')
+        wf = self.profile_home / 'webui_state' / 'workspaces.json'
+        self.assertTrue(wf.exists())
+        import json as _json
+        data = _json.loads(wf.read_text(encoding='utf-8'))
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]['name'], 'Home (seedtest)')
+        self.assertEqual(data[0]['path'], str((self.profile_home / 'workspace').resolve()))
+
+    def test_preserves_existing_workspaces_json(self):
+        """Re-seeding must not clobber user-added workspace entries."""
+        from api.admin_users import _seed_default_workspace
+        wf = self.profile_home / 'webui_state'
+        wf.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        (wf / 'workspaces.json').write_text(
+            _json.dumps([{'name': 'My Project', 'path': '/some/path'}]),
+            encoding='utf-8',
+        )
+        _seed_default_workspace('user_seedtest')
+        data = _json.loads((wf / 'workspaces.json').read_text(encoding='utf-8'))
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]['name'], 'My Project',
+                         "re-seed must not destroy user-added workspaces")
+
+    def test_empty_profile_name_is_noop(self):
+        from api.admin_users import _seed_default_workspace
+        _seed_default_workspace('')  # must not raise
+
+
 if __name__ == '__main__':
     unittest.main()

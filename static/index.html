@@ -305,6 +305,26 @@
           <span>Admin</span>
         </button>
       </div>
+      <!-- ── Current-user card (always visible to logged-in users) ───── -->
+      <!-- Populated by adminApplyRoleVisibility. Sign-out button works for
+           every role, since the System tab's Sign Out is hidden from
+           non-admins by the role-visibility hook. -->
+      <div class="settings-user-card" id="settingsUserCard" hidden>
+        <div class="settings-user-card__avatar" id="settingsUserCardAvatar"></div>
+        <div class="settings-user-card__info">
+          <div class="settings-user-card__name" id="settingsUserCardName"></div>
+          <div class="settings-user-card__role" id="settingsUserCardRole"></div>
+        </div>
+        <button type="button" class="settings-user-card__signout"
+                id="settingsUserCardSignout" onclick="signOut()"
+                title="退出登录" aria-label="退出登录">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+        </button>
+      </div>
     </div>
   <div class="resize-handle" id="sidebarResize"></div>
   </aside>

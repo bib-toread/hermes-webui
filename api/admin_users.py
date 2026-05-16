@@ -132,6 +132,13 @@ def handle_init_admin_create(handler, parsed, body) -> bool:
     except Exception:
         logger.debug("snapshot_admin_to_global on init failed", exc_info=True)
 
+    # Seed a default workspace pointer so the first admin lands in their
+    # own profile workspace rather than the process-global DEFAULT_WORKSPACE
+    # (which would still resolve to a path likely outside the multi-user
+    # tenancy model — e.g. ~/workspace shared with every user).
+    _seed_default_workspace(new_user['profile_name'],
+                            display_name=f"Home ({new_user['username']})")
+
     # Auto-login the new admin by setting a session cookie.
     from api.auth import create_session_for_user, set_auth_cookie, _security_headers_safe
     cookie_val = create_session_for_user(new_user['id'])
@@ -175,6 +182,60 @@ def handle_admin_users_get(handler, parsed) -> bool:
         'users': [_augment_with_usage(r) for r in rows],
         'orphan_profiles': _list_orphan_profiles(rows),
     })
+
+
+def _seed_default_workspace(profile_name: str, display_name: str = "Home") -> None:
+    """Seed a fresh user's profile with a default workspace pointer.
+
+    Writes two per-profile files under ``<profile>/webui_state/``:
+      - ``last_workspace.txt`` → ``<profile>/workspace/`` so the new user
+        lands in their own isolated workspace on first login (not the
+        WebUI's process-global DEFAULT_WORKSPACE which would leak shared
+        state across users).
+      - ``workspaces.json`` → a single picker entry labeled ``Home``
+        pointing at the same dir so the workspace switcher in the right
+        rail isn't empty on first open.
+
+    Idempotent — re-running on an already-seeded profile just refreshes
+    the pointer files; never deletes user-added workspace entries.
+    """
+    if not profile_name:
+        return
+    try:
+        from api.profiles import _resolve_profile_home_for_name
+        profile_home = _resolve_profile_home_for_name(profile_name)
+        ws_dir = profile_home / 'webui_state'
+        workspace_dir = profile_home / 'workspace'
+        try:
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            ws_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.debug("workspace seed mkdir failed for %s", profile_name, exc_info=True)
+            return
+        # last_workspace.txt — overwrite is fine (admin-side seed).
+        try:
+            (ws_dir / 'last_workspace.txt').write_text(
+                str(workspace_dir.resolve()), encoding='utf-8',
+            )
+        except OSError:
+            logger.debug("failed to write last_workspace.txt for %s", profile_name, exc_info=True)
+        # workspaces.json — only write if missing, so we don't trash any
+        # entries the user (or a previous admin seed) already added.
+        ws_list_file = ws_dir / 'workspaces.json'
+        if not ws_list_file.exists():
+            try:
+                import json as _json
+                ws_list_file.write_text(
+                    _json.dumps([{
+                        'name': display_name,
+                        'path': str(workspace_dir.resolve()),
+                    }], ensure_ascii=False, indent=2),
+                    encoding='utf-8',
+                )
+            except OSError:
+                logger.debug("failed to write workspaces.json for %s", profile_name, exc_info=True)
+    except Exception:
+        logger.debug("_seed_default_workspace failed for %s", profile_name, exc_info=True)
 
 
 def _list_orphan_profiles(rows: list) -> list[dict]:
@@ -249,6 +310,12 @@ def handle_admin_users_post(handler, parsed, body) -> bool:
     except Exception as exc:
         logger.exception("create user failed")
         return bad(handler, str(exc), status=500)
+    # Seed a default per-profile workspace so bob's right-rail file browser
+    # opens at his own ~/.hermes/profiles/user_bob/workspace/ on first login,
+    # not at whatever last_workspace.txt the OS happened to have lying around.
+    _seed_default_workspace(new_user['profile_name'],
+                            display_name=f"Home ({new_user['username']})")
+
     users.write_audit(new_user['id'], 'user_created', actor_user_id=actor['id'])
     return j(handler, _serialize_user(new_user), status=201)
 
