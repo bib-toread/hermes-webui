@@ -5,6 +5,7 @@
 document.addEventListener('DOMContentLoaded', function () {
   var form = document.getElementById('login-form');
   var input = document.getElementById('pw');
+  var unameInput = document.getElementById('username');
 
   if (!form || !input) return;
 
@@ -38,14 +39,24 @@ document.addEventListener('DOMContentLoaded', function () {
   async function doLogin(e) {
     e.preventDefault();
     var pw = input.value;
+    var username = unameInput ? unameInput.value.trim().toLowerCase() : '';
     hideErr();
     try {
       var res = await fetch('api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pw }),
+        body: JSON.stringify({ username: username, password: pw }),
         credentials: 'include',
       });
+      // 409 → server says we still need to initialize the first admin.
+      if (res.status === 409) {
+        var d = {};
+        try { d = await res.json(); } catch (_) {}
+        if (d && d.next) {
+          window.location.href = d.next;
+          return;
+        }
+      }
       var data = {};
       try { data = await res.json(); } catch (_) {}
       if (res.ok && data.ok) {

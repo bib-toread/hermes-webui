@@ -171,6 +171,21 @@ def pytest_configure(config):
 # imports trigger botocore initialisation.
 os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 
+# ── Multi-user auth bypass (test fleet only) ──────────────────────────────
+# The multi-user refactor forces every request without a logged-in user to
+# /init-admin until the operator creates the first admin. The existing test
+# suite (CSRF probes, path-traversal probes, content-disposition checks,
+# SSRF guards, etc.) all hit unauthenticated endpoints and expect their
+# specific 4xx response, not the init-admin redirect. Set the documented
+# escape hatch here so existing tests keep working WITHOUT having to
+# bootstrap an admin in every test.
+#
+# The new multi-user-specific tests (test_multiuser_*.py) are pure in-process
+# unit tests that don't touch this flag; they exercise check_auth() directly.
+#
+# NEVER set this outside the test environment — it disables all auth.
+os.environ.setdefault("HERMES_WEBUI_TEST_NO_AUTH", "1")
+
 # ── Hermetic network isolation ─────────────────────────────────────────────
 # Tests must not reach the public internet. Outbound to Anthropic / OpenAI /
 # Amazon / OpenRouter / etc. is forbidden by default. The test suite already

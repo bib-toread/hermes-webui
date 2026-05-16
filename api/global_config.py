@@ -1,0 +1,239 @@
+"""
+Hermes Web UI -- Global (admin-controlled) model & system config.
+
+Multi-user model: admin owns providers / API keys / custom relays / default
+model / reasoning config. Regular users INHERIT these from a global source of
+truth and cannot override.
+
+Storage:
+  ``~/.hermes/global/config.yaml``  — mirrors keys: model, custom_providers,
+                                       display, agent
+  ``~/.hermes/global/.env``         — mirrors provider API keys
+
+Flow:
+  1. Admin writes to a config endpoint (e.g. /api/providers). The underlying
+     setter (``set_provider_key``, ``upsert_custom_relay``, ...) already
+     writes to the admin's *own profile* config (via thread-local TLS).
+  2. After the write, the route handler calls
+     ``snapshot_admin_to_global(admin_profile)`` to copy the just-written
+     admin profile config into the global location.
+  3. ``mirror_global_to_all_users()`` then cascades to every other user's
+     profile dir, replacing their .env wholesale and merging only the
+     mirror-eligible top-level keys into their config.yaml (preserving any
+     keys outside the mirror set).
+  4. On user create, ``seed_user_profile_from_global()`` initialises the
+     new profile from the global config.
+
+User-side: every chat turn already reads ``$HERMES_HOME/config.yaml`` and
+``.env`` of the active profile (see api/streaming.py + api/profiles.py).
+Because we mirror eagerly on every admin write, the next turn sees the
+update — that's the "立即生效" guarantee the operator asked for.
+"""
+from __future__ import annotations
+
+import logging
+import shutil
+import threading
+from pathlib import Path
+
+from api.profiles import _DEFAULT_HERMES_HOME, _PROFILE_ID_RE, _is_root_profile
+
+logger = logging.getLogger(__name__)
+
+# Serializes snapshot+mirror so two concurrent admin writes can't interleave
+# (admin A snapshots while admin B is still copying → mixed state). Held only
+# for the duration of file IO, which is fast; admin endpoints are low-QPS.
+_CASCADE_LOCK = threading.Lock()
+
+# Top-level keys in config.yaml that are mirrored from global → per-user.
+# Anything outside this set in a user's profile config.yaml is preserved.
+GLOBAL_CONFIG_KEYS = ('model', 'custom_providers', 'display', 'agent')
+
+
+def global_root() -> Path:
+    return _DEFAULT_HERMES_HOME / "global"
+
+
+def global_config_yaml() -> Path:
+    return global_root() / "config.yaml"
+
+
+def global_env() -> Path:
+    return global_root() / ".env"
+
+
+def ensure_global_root() -> Path:
+    d = global_root()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.debug("failed to mkdir %s", d, exc_info=True)
+    return d
+
+
+def _profile_dir(profile_name: str) -> Path:
+    """Resolve a profile_name to its on-disk directory.
+
+    Thin wrapper over ``api.profiles._resolve_profile_home_for_name`` so
+    every call site that needs a profile path goes through the same
+    canonical resolver (handles renamed-root aliases, validates the name
+    regex, and never escapes the profiles root via traversal).
+    """
+    from api.profiles import _resolve_profile_home_for_name
+    return _resolve_profile_home_for_name(profile_name or '')
+
+
+def _safe_copy_env(src: Path, dst: Path) -> None:
+    try:
+        shutil.copy2(src, dst)
+        try:
+            dst.chmod(0o600)
+        except OSError:
+            pass
+    except OSError:
+        logger.debug("env copy failed src=%s dst=%s", src, dst, exc_info=True)
+
+
+def _merge_yaml_keys(src_yaml: Path, dst_yaml: Path, keys: tuple) -> None:
+    """Merge top-level *keys* from src_yaml into dst_yaml; preserve others.
+
+    No-op if PyYAML is missing or src is unreadable.
+    """
+    try:
+        import yaml
+    except ImportError:
+        logger.debug("PyYAML unavailable; skipping config.yaml merge")
+        return
+    try:
+        src_data = yaml.safe_load(src_yaml.read_text(encoding='utf-8')) or {}
+    except Exception:
+        logger.debug("failed to read src yaml %s", src_yaml, exc_info=True)
+        return
+    if not isinstance(src_data, dict):
+        return
+    dst_data: dict = {}
+    if dst_yaml.exists():
+        try:
+            loaded = yaml.safe_load(dst_yaml.read_text(encoding='utf-8'))
+            if isinstance(loaded, dict):
+                dst_data = loaded
+        except Exception:
+            logger.debug("failed to read dst yaml %s; will overwrite", dst_yaml, exc_info=True)
+    for k in keys:
+        if k in src_data:
+            dst_data[k] = src_data[k]
+        else:
+            # Key absent from global → remove from dst so "admin removed it"
+            # actually propagates instead of leaving stale per-user values.
+            dst_data.pop(k, None)
+    try:
+        dst_yaml.parent.mkdir(parents=True, exist_ok=True)
+        dst_yaml.write_text(
+            yaml.dump(dst_data, default_flow_style=False, allow_unicode=True),
+            encoding='utf-8',
+        )
+    except OSError:
+        logger.debug("failed to write dst yaml %s", dst_yaml, exc_info=True)
+
+
+def snapshot_admin_to_global(admin_profile_name: str) -> None:
+    """Copy admin's just-written config.yaml + .env into the global location.
+
+    Called by the route handler IMMEDIATELY after an admin saves any
+    model/provider/relay/reasoning/default-model setting (which the
+    underlying setter wrote to ``$HERMES_HOME/config.yaml`` of the admin's
+    profile via thread-local TLS).
+    """
+    if not admin_profile_name:
+        return
+    src_dir = _profile_dir(admin_profile_name)
+    dst_dir = ensure_global_root()
+    for fname in ('config.yaml', '.env'):
+        src = src_dir / fname
+        if not src.exists():
+            continue
+        dst = dst_dir / fname
+        try:
+            shutil.copy2(src, dst)
+        except OSError:
+            logger.debug("snapshot %s → %s failed", src, dst, exc_info=True)
+        else:
+            if fname == '.env':
+                try:
+                    dst.chmod(0o600)
+                except OSError:
+                    pass
+
+
+def mirror_global_to_all_users(skip_profile: str | None = None) -> int:
+    """Cascade the global config into every user profile dir.
+
+    Returns the number of profiles updated. *skip_profile* (typically the
+    admin's profile, which IS the source) is excluded so we don't write
+    back over the source while it's being read.
+    """
+    from api import users as _users_mod
+
+    cfg = global_config_yaml()
+    env = global_env()
+    if not cfg.exists() and not env.exists():
+        return 0
+    count = 0
+    try:
+        all_users = _users_mod.list_users()
+    except Exception:
+        logger.debug("list_users failed in mirror", exc_info=True)
+        return 0
+    for u in all_users:
+        pname = u.get('profile_name')
+        if not pname or pname == skip_profile:
+            continue
+        pdir = _profile_dir(pname)
+        if not pdir.exists():
+            continue
+        if cfg.exists():
+            _merge_yaml_keys(cfg, pdir / 'config.yaml', GLOBAL_CONFIG_KEYS)
+        if env.exists():
+            _safe_copy_env(env, pdir / '.env')
+        count += 1
+    return count
+
+
+def cascade_from_admin(admin_profile_name: str) -> dict:
+    """One-shot: snapshot admin → global, then mirror global → everyone else.
+
+    Serialized under ``_CASCADE_LOCK`` so two concurrent admin writes can't
+    interleave their file IO. The lock is held only for the duration of the
+    snapshot+mirror (fast, all local FS); admin endpoints are low-QPS so
+    contention is negligible.
+
+    Returns ``{'mirrored': <count>}`` for the route handler to optionally
+    return to the client (the UI doesn't need this, but logs do).
+    """
+    with _CASCADE_LOCK:
+        snapshot_admin_to_global(admin_profile_name)
+        mirrored = mirror_global_to_all_users(skip_profile=admin_profile_name)
+    return {'mirrored': mirrored}
+
+
+def seed_user_profile_from_global(profile_name: str) -> None:
+    """For a newly-created user, populate their fresh profile with the
+    current global config (so they start with admin-approved providers).
+
+    Idempotent. No-op when there's no global config yet (the case before
+    the very first admin write — new users just inherit nothing, which is
+    fine because they'll get cascaded as soon as admin saves once).
+    """
+    if not profile_name:
+        return
+    pdir = _profile_dir(profile_name)
+    try:
+        pdir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    cfg = global_config_yaml()
+    env = global_env()
+    if cfg.exists():
+        _merge_yaml_keys(cfg, pdir / 'config.yaml', GLOBAL_CONFIG_KEYS)
+    if env.exists():
+        _safe_copy_env(env, pdir / '.env')

@@ -489,7 +489,8 @@ class TestHMACLength:
         import secrets
 
         token = secrets.token_hex(32)
-        _sessions[token] = time.time() + 3600  # valid session
+        # Multi-user session payload shape; bare floats are rejected as expired.
+        _sessions[token] = {'user_id': None, 'exp': time.time() + 3600}
         old_sig = _hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()[:16]
         old_cookie = f"{token}.{old_sig}"
         # Should fail: sig length wrong
@@ -557,7 +558,7 @@ class TestContentDisposition:
         import ast
         import pathlib
         routes_src = pathlib.Path(__file__).parent.parent / "api" / "routes.py"
-        src = routes_src.read_text()
+        src = routes_src.read_text(encoding='utf-8')
         assert "text/html" in src
         assert "application/xhtml+xml" in src
         assert "image/svg+xml" in src
@@ -656,7 +657,7 @@ class TestPasswordHashing:
         # Remember original content so we can restore it
         original = None
         if SETTINGS_FILE.exists():
-            original = SETTINGS_FILE.read_text()
+            original = SETTINGS_FILE.read_text(encoding='utf-8')
 
         try:
             save_settings({"_set_password": "test_pbkdf2_pw"})
@@ -679,7 +680,7 @@ class TestStartupWarning:
     def test_warning_code_present_in_server(self):
         """server.py must contain non-loopback warning code."""
         src = pathlib.Path(__file__).parent.parent / "server.py"
-        text = src.read_text()
+        text = src.read_text(encoding='utf-8')
         assert "0.0.0.0" in text or "non-loopback" in text.lower() or "WARNING" in text, \
             "server.py must contain non-loopback warning logic"
         assert "is_auth_enabled" in text, \
@@ -693,7 +694,7 @@ class TestSSRFCheck:
     def test_ssrf_guard_code_present_in_config(self):
         """config.py must contain SSRF DNS resolution guard."""
         src = pathlib.Path(__file__).parent.parent / "api" / "config.py"
-        text = src.read_text()
+        text = src.read_text(encoding='utf-8')
         assert "getaddrinfo" in text, "SSRF guard must resolve DNS with getaddrinfo"
         assert "is_private" in text, "SSRF guard must check is_private IP"
         assert "is_loopback" in text, "SSRF guard must check is_loopback IP"
@@ -701,7 +702,7 @@ class TestSSRFCheck:
     def test_known_local_providers_whitelisted(self):
         """Ollama and localhost endpoints should NOT be blocked by SSRF guard."""
         src = pathlib.Path(__file__).parent.parent / "api" / "config.py"
-        text = src.read_text()
+        text = src.read_text(encoding='utf-8')
         assert "ollama" in text.lower()
         assert "localhost" in text.lower()
         assert "lmstudio" in text.lower() or "lm-studio" in text.lower()

@@ -53,13 +53,30 @@ PUBLIC_PATHS = frozenset({
     '/session/manifest.json', '/session/manifest.webmanifest',
 })
 
+# Init-admin paths — reachable WITHOUT a session ONLY while users.db is
+# empty. check_auth grants the exemption conditionally. Moved out of the
+# static PUBLIC_PATHS set so the endpoints don't stay world-callable
+# forever (#review-fix bug_017: e.g. /api/init-admin/create previously
+# remained unauthenticated even after the first admin was created;
+# protection relied entirely on the inner handler's has_any_user check).
+_INIT_ADMIN_PATHS = frozenset({
+    '/init-admin',
+    '/api/init-admin/status',
+    '/api/init-admin/create',
+})
+
 COOKIE_NAME = 'hermes_session'
 
 _SESSIONS_FILE = STATE_DIR / '.sessions.json'
 
 
-def _load_sessions() -> dict[str, float]:
+def _load_sessions() -> dict[str, dict]:
     """Load persisted sessions from STATE_DIR, pruning expired entries.
+
+    Session payload shape is ``{'user_id': int|None, 'exp': float}``.
+    Legacy entries (bare float expiry) are discarded on load — users will
+    need to re-authenticate, which is fine because the multi-user model
+    requires a user_id binding that legacy sessions don't carry.
 
     Returns an empty dict on any read or parse error so startup is never
     blocked by a corrupt or missing sessions file.
@@ -70,14 +87,38 @@ def _load_sessions() -> dict[str, float]:
             if not isinstance(data, dict):
                 raise ValueError('malformed sessions file — expected dict')
             now = time.time()
-            return {t: exp for t, exp in data.items()
-                    if isinstance(t, str) and isinstance(exp, (int, float)) and exp > now}
+            out: dict[str, dict] = {}
+            _legacy_dropped = 0
+            for token, payload in data.items():
+                if not isinstance(token, str):
+                    continue
+                if isinstance(payload, dict):
+                    exp = payload.get('exp')
+                    if isinstance(exp, (int, float)) and exp > now:
+                        out[token] = {
+                            'user_id': payload.get('user_id'),
+                            'exp': float(exp),
+                        }
+                elif isinstance(payload, (int, float)) and payload > now:
+                    # Legacy single-user session: bare float expiry, no user_id.
+                    # Dropped because multi-user routes require a user binding.
+                    _legacy_dropped += 1
+            if _legacy_dropped:
+                # Loud one-time warning so operators upgrading from single-user
+                # mode understand why everyone got logged out.
+                logger.warning(
+                    "[webui] multi-user upgrade: dropped %d pre-existing single-user "
+                    "session(s) from %s. Affected users must log in again via /login "
+                    "with the username/password the admin assigned them.",
+                    _legacy_dropped, _SESSIONS_FILE,
+                )
+            return out
     except Exception as e:
         logger.debug("Failed to load sessions file, starting fresh: %s", e)
     return {}
 
 
-def _save_sessions(sessions: dict[str, float]) -> None:
+def _save_sessions(sessions: dict[str, dict]) -> None:
     """Atomically persist sessions to STATE_DIR/.sessions.json (0600).
 
     Uses a temp file + os.replace() so a crash mid-write never leaves a
@@ -290,8 +331,26 @@ def get_password_hash() -> str | None:
 
 
 def is_auth_enabled() -> bool:
-    """True if a password is configured (env var or settings)."""
-    return get_password_hash() is not None
+    """True when ANY auth mechanism is active.
+
+    Returns True if EITHER:
+      - a legacy single-password is configured (env var or settings.json), OR
+      - the multi-user system has at least one user in users.db.
+
+    Without the multi-user branch, every clean multi-user deployment would
+    fail this check (no env password, no settings password) and downstream
+    consumers would emit nonsense — e.g. server.py warning operators to
+    set HERMES_WEBUI_PASSWORD on a fully-authenticated 0.0.0.0 bind, and
+    /api/onboarding/* refusing authenticated admins from non-LAN IPs.
+    (#review-fix bug_023a)
+    """
+    if get_password_hash() is not None:
+        return True
+    try:
+        from api import users as _users_mod
+        return _users_mod.has_any_user()
+    except Exception:
+        return False
 
 
 def verify_password(plain: str) -> bool:
@@ -326,9 +385,18 @@ def verify_password(plain: str) -> bool:
 
 
 def create_session() -> str:
-    """Create a new auth session. Returns signed cookie value."""
+    """Create a legacy (no user binding) auth session. Kept for backward
+    compatibility callers; multi-user flows should use create_session_for_user."""
+    return create_session_for_user(None)
+
+
+def create_session_for_user(user_id: int | None) -> str:
+    """Create a session bound to *user_id*. Returns signed cookie value."""
     token = secrets.token_hex(32)
-    _sessions[token] = time.time() + _resolve_session_ttl()
+    _sessions[token] = {
+        'user_id': int(user_id) if user_id is not None else None,
+        'exp': time.time() + _resolve_session_ttl(),
+    }
     _save_sessions(_sessions)
     sig = hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()
     return f"{token}.{sig}"
@@ -337,33 +405,108 @@ def create_session() -> str:
 def _prune_expired_sessions():
     """Remove all expired session entries to prevent unbounded memory growth."""
     now = time.time()
-    expired = [t for t, exp in _sessions.items() if now > exp]
+    expired = [t for t, p in _sessions.items() if not isinstance(p, dict) or now > p.get('exp', 0)]
     if expired:
         for token in expired:
             _sessions.pop(token, None)
         _save_sessions(_sessions)
 
 
-def verify_session(cookie_value: str) -> bool:
-    """Verify a signed session cookie. Returns True if valid and not expired."""
+def _validate_cookie_signature(cookie_value: str) -> str | None:
+    """Return the unsigned session token if the cookie's HMAC matches, else None."""
     if not cookie_value or '.' not in cookie_value:
-        return False
-    _prune_expired_sessions()  # lazy cleanup on every verification attempt
+        return None
     token, sig = cookie_value.rsplit('.', 1)
     full_sig = hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()
-    # Accept both new (64-char) and legacy (32-char truncated) signatures so
-    # existing sessions survive the upgrade without a forced global logout.
-    # The legacy branch can be removed once session TTLs have expired (~30 days).
     valid = hmac.compare_digest(sig, full_sig) or (
         len(sig) == 32 and hmac.compare_digest(sig, full_sig[:32])
     )
-    if not valid:
+    return token if valid else None
+
+
+def verify_session(cookie_value: str) -> bool:
+    """Verify a signed session cookie. Returns True if valid and not expired.
+
+    Early-out on empty / dotless cookies BEFORE the prune call so requests
+    that carry a malformed Cookie header don't trigger an O(N) prune on
+    every hit. (#review-fix bug_011 perf half.)
+    """
+    if not cookie_value or '.' not in cookie_value:
         return False
-    expiry = _sessions.get(token)
-    if not expiry or time.time() > expiry:
+    _prune_expired_sessions()
+    token = _validate_cookie_signature(cookie_value)
+    if not token:
+        return False
+    payload = _sessions.get(token)
+    if not isinstance(payload, dict):
+        return False
+    exp = payload.get('exp', 0)
+    if not exp or time.time() > exp:
         _sessions.pop(token, None)
         return False
     return True
+
+
+def resolve_session_user_id(cookie_value: str) -> int | None:
+    """Return the user_id bound to *cookie_value*, or None if invalid/expired."""
+    if not verify_session(cookie_value):
+        return None
+    token = _validate_cookie_signature(cookie_value)
+    payload = _sessions.get(token) if token else None
+    if not isinstance(payload, dict):
+        return None
+    uid = payload.get('user_id')
+    return int(uid) if uid is not None else None
+
+
+def current_user(handler) -> dict | None:
+    """Return the user dict bound to the request's auth cookie, or None.
+
+    Result is cached on the handler (``handler._user``) so repeated calls
+    inside a single request don't re-query the DB.
+    """
+    cached = getattr(handler, '_user', _UNSET)
+    if cached is not _UNSET:
+        return cached
+    user: dict | None = None
+    try:
+        cookie_val = parse_cookie(handler)
+        if cookie_val:
+            uid = resolve_session_user_id(cookie_val)
+            if uid is not None:
+                from api import users as users_mod
+                user = users_mod.get_user_by_id(uid)
+                if user and user.get('disabled'):
+                    user = None
+    except Exception:
+        logger.debug("current_user lookup failed", exc_info=True)
+    handler._user = user
+    return user
+
+
+def require_admin(handler) -> bool:
+    """Return True if request is from an admin; else send 403 and return False."""
+    user = current_user(handler)
+    if user and user.get('role') == 'admin':
+        return True
+    handler.send_response(403)
+    handler.send_header('Content-Type', 'application/json')
+    handler.end_headers()
+    handler.wfile.write(b'{"error":"admin only"}')
+    return False
+
+
+_UNSET = object()
+
+
+# Re-export a name admin_users.py imports for cookie/security helpers.
+def _security_headers_safe(handler) -> None:
+    """Thin wrapper so api/admin_users.py doesn't need to import api/helpers."""
+    try:
+        from api.helpers import _security_headers
+        _security_headers(handler)
+    except Exception:
+        logger.debug("_security_headers unavailable", exc_info=True)
 
 
 def invalidate_session(cookie_value) -> None:
@@ -373,6 +516,21 @@ def invalidate_session(cookie_value) -> None:
         if token in _sessions:
             _sessions.pop(token, None)
             _save_sessions(_sessions)
+
+
+def invalidate_sessions_for_user(user_id: int) -> int:
+    """Drop every active session belonging to *user_id*. Returns count removed.
+
+    Called after admin disables/deletes a user so existing cookies stop working.
+    """
+    if user_id is None:
+        return 0
+    dropped = [t for t, p in _sessions.items() if isinstance(p, dict) and p.get('user_id') == int(user_id)]
+    for t in dropped:
+        _sessions.pop(t, None)
+    if dropped:
+        _save_sessions(_sessions)
+    return len(dropped)
 
 
 def parse_cookie(handler) -> str | None:
@@ -391,16 +549,63 @@ def parse_cookie(handler) -> str | None:
 
 def check_auth(handler, parsed) -> bool:
     """Check if request is authorized. Returns True if OK.
-    If not authorized, sends 401 (API) or 302 redirect (page) and returns False."""
-    if not is_auth_enabled():
+    If not authorized, sends 401 (API) or 302 redirect (page) and returns False.
+
+    Multi-user gate (added):
+      - If the users table is empty AND this is not an init-admin / static path,
+        redirect to /init-admin so the operator can create the first admin.
+      - Otherwise require a valid session cookie that resolves to an enabled
+        user. Legacy single-password mode (HERMES_WEBUI_PASSWORD) is honoured
+        only when there are no users yet and no init-admin work in progress.
+
+    Test escape hatch: ``HERMES_WEBUI_TEST_NO_AUTH=1`` bypasses both the
+    init-admin gate and the cookie check, returning True for every path.
+    Used by the live-server test fleet (tests/conftest.py) so existing tests
+    that don't care about multi-user keep working without per-test setup.
+    Never set this in production — it disables ALL auth.
+    """
+    if os.environ.get('HERMES_WEBUI_TEST_NO_AUTH', '').strip() in ('1', 'true', 'yes'):
         return True
-    # Public paths don't require auth
+
+    # Public + static paths always allowed.
     if parsed.path in PUBLIC_PATHS or parsed.path.startswith('/static/') or parsed.path.startswith('/session/static/'):
         return True
-    # Check session cookie
-    cookie_val = parse_cookie(handler)
-    if cookie_val and verify_session(cookie_val):
+
+    # Init-admin gate: if no users yet, route everything else to /init-admin.
+    try:
+        from api import users as users_mod
+        any_user = users_mod.has_any_user()
+    except Exception:
+        logger.debug("has_any_user lookup failed", exc_info=True)
+        any_user = True  # fail-closed: don't expose init-admin on DB errors
+
+    # Init-admin paths are public ONLY while bootstrap is incomplete. Once
+    # any_user is True, these endpoints require a session like any other —
+    # otherwise /api/init-admin/create stays unauthenticated forever and
+    # protection collapses to whatever the inner handler bothers to check.
+    if parsed.path in _INIT_ADMIN_PATHS and not any_user:
         return True
+    if not any_user:
+        if parsed.path.startswith('/api/'):
+            handler.send_response(401)
+            handler.send_header('Content-Type', 'application/json')
+            handler.end_headers()
+            handler.wfile.write(b'{"error":"setup required","next":"/init-admin"}')
+        else:
+            handler.send_response(302)
+            handler.send_header('Location', '/init-admin')
+            handler.end_headers()
+        return False
+
+    # Normal multi-user auth path.
+    cookie_val = parse_cookie(handler)
+    if cookie_val:
+        uid = resolve_session_user_id(cookie_val)
+        if uid is not None:
+            from api import users as users_mod
+            user = users_mod.get_user_by_id(uid)
+            if user and not user.get('disabled'):
+                return True
     # Not authorized
     if parsed.path.startswith('/api/'):
         handler.send_response(401)
