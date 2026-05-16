@@ -402,6 +402,51 @@ class TestSeedDefaultWorkspace(unittest.TestCase):
         from api.admin_users import _seed_default_workspace
         _seed_default_workspace('')  # must not raise
 
+    def test_seeds_terminal_cwd_in_config_yaml(self):
+        """terminal.cwd in config.yaml MUST be set so the agent's runtime
+        TERMINAL_CWD env var lands inside the user's profile even when a
+        stale session.workspace points at the global default. (#fix for
+        '/root/workspace leaks into tool execution' bug.)"""
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        from api.admin_users import _seed_default_workspace
+        _seed_default_workspace('user_seedtest')
+        cfg = self.profile_home / 'config.yaml'
+        self.assertTrue(cfg.exists(), "config.yaml should be created")
+        data = yaml.safe_load(cfg.read_text(encoding='utf-8'))
+        self.assertIsInstance(data, dict)
+        self.assertIn('terminal', data)
+        self.assertEqual(
+            data['terminal'].get('cwd'),
+            str((self.profile_home / 'workspace').resolve()),
+        )
+
+    def test_terminal_cwd_seed_preserves_other_keys(self):
+        """Re-seeding must not blow away existing top-level keys in config.yaml
+        (e.g. model, custom_providers that came from global mirror)."""
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        cfg = self.profile_home / 'config.yaml'
+        cfg.write_text(
+            "model:\n  default: gpt-5-mini\ncustom_providers:\n  relay1:\n    url: x\n",
+            encoding='utf-8',
+        )
+        from api.admin_users import _seed_default_workspace
+        _seed_default_workspace('user_seedtest')
+        data = yaml.safe_load(cfg.read_text(encoding='utf-8'))
+        # model + custom_providers must survive
+        self.assertEqual(data['model']['default'], 'gpt-5-mini')
+        self.assertIn('relay1', data['custom_providers'])
+        # terminal.cwd now also set
+        self.assertEqual(
+            data['terminal']['cwd'],
+            str((self.profile_home / 'workspace').resolve()),
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

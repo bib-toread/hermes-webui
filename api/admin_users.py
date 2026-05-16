@@ -234,8 +234,53 @@ def _seed_default_workspace(profile_name: str, display_name: str = "Home") -> No
                 )
             except OSError:
                 logger.debug("failed to write workspaces.json for %s", profile_name, exc_info=True)
+        # config.yaml — set terminal.cwd to the per-profile workspace so the
+        # agent's runtime TERMINAL_CWD env var lands inside the user's own
+        # tree even when a stale session.workspace points elsewhere. This is
+        # the safety net that catches the case where get_last_workspace()
+        # would otherwise return a bad value (e.g. global /root/workspace
+        # leaked into last_workspace.txt by a prior install / picker bug).
+        try:
+            _seed_terminal_cwd_in_config(profile_home / 'config.yaml',
+                                         str(workspace_dir.resolve()))
+        except Exception:
+            logger.debug("failed to seed terminal.cwd for %s", profile_name, exc_info=True)
     except Exception:
         logger.debug("_seed_default_workspace failed for %s", profile_name, exc_info=True)
+
+
+def _seed_terminal_cwd_in_config(config_yaml_path: Path, cwd: str) -> None:
+    """Ensure ``terminal.cwd`` in profile config.yaml points at *cwd*.
+
+    Preserves all other keys in the file. Safe to call repeatedly. No-op
+    when PyYAML is unavailable (admin will need to set terminal.cwd by
+    hand in that environment). 'terminal' is NOT in GLOBAL_CONFIG_KEYS so
+    this value survives later admin-side global config cascades.
+    """
+    try:
+        import yaml as _yaml
+    except ImportError:
+        logger.debug("PyYAML unavailable; skip terminal.cwd seed for %s", config_yaml_path)
+        return
+    data: dict = {}
+    if config_yaml_path.exists():
+        try:
+            loaded = _yaml.safe_load(config_yaml_path.read_text(encoding='utf-8'))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            logger.debug("config.yaml unreadable at %s; will overwrite", config_yaml_path, exc_info=True)
+    term = data.get('terminal') if isinstance(data.get('terminal'), dict) else {}
+    term['cwd'] = cwd
+    data['terminal'] = term
+    try:
+        config_yaml_path.parent.mkdir(parents=True, exist_ok=True)
+        config_yaml_path.write_text(
+            _yaml.dump(data, default_flow_style=False, allow_unicode=True),
+            encoding='utf-8',
+        )
+    except OSError:
+        logger.debug("failed to write %s", config_yaml_path, exc_info=True)
 
 
 def _list_orphan_profiles(rows: list) -> list[dict]:

@@ -224,22 +224,89 @@ def save_workspaces(workspaces: list) -> None:
 
 
 def get_last_workspace() -> str:
+    """Resolve the active workspace for the current request's profile.
+
+    Multi-user-safe resolution chain:
+      1. <profile>/webui_state/last_workspace.txt — but ONLY if the path
+         is registered in <profile>/webui_state/workspaces.json. This
+         prevents stale paths (e.g. a leaked process-global /root/workspace
+         written by a prior install) from leaking into per-user sessions.
+      2. First entry in the profile's workspaces.json (the "Home" entry
+         that admin_users._seed_default_workspace plants on user create).
+      3. Global ~/.hermes/webui/last_workspace.txt — only honoured if its
+         path is itself inside the active profile's directory tree (no
+         cross-profile leak).
+      4. _profile_default_workspace() — reads cfg terminal.cwd, else
+         DEFAULT_WORKSPACE constant. Last resort.
+
+    Returns a str path. Always a directory that exists at call time.
+    """
+    # Build the set of "allowed" workspace paths for this profile.
+    allowed: set[str] = set()
+    try:
+        raw = json.loads(_workspaces_file().read_text(encoding='utf-8')) \
+            if _workspaces_file().exists() else []
+        for w in raw:
+            p = w.get('path') if isinstance(w, dict) else None
+            if p:
+                try:
+                    allowed.add(str(Path(p).expanduser().resolve()))
+                except Exception:
+                    pass
+    except Exception:
+        logger.debug("Failed to read workspaces.json for allowed-set", exc_info=True)
+
+    # 1. last_workspace.txt — only if registered.
     lw_file = _last_workspace_file()
     if lw_file.exists():
         try:
             p = lw_file.read_text(encoding='utf-8').strip()
             if p and Path(p).is_dir():
-                return p
+                resolved = str(Path(p).expanduser().resolve())
+                # When workspaces.json exists, demand membership. When it
+                # doesn't (very old install / mid-migration), trust the file.
+                if not allowed or resolved in allowed:
+                    return resolved
+                logger.info(
+                    "[webui] dropping stale per-profile last_workspace=%r "
+                    "(not in workspaces.json); falling back to first registered entry",
+                    p,
+                )
         except Exception:
             logger.debug("Failed to read last workspace from %s", lw_file)
-    # Fallback: try global file
+
+    # 2. First registered workspace (Home seed).
+    if allowed:
+        # Preserve workspaces.json order — read the file again rather than
+        # the unordered set we built above.
+        try:
+            raw = json.loads(_workspaces_file().read_text(encoding='utf-8'))
+            for w in raw:
+                p = (w or {}).get('path')
+                if p:
+                    pp = Path(p).expanduser()
+                    if pp.is_dir():
+                        return str(pp.resolve())
+        except Exception:
+            logger.debug("Failed to scan workspaces.json for fallback", exc_info=True)
+
+    # 3. Global file — only if its path lies inside our active profile dir.
     if _GLOBAL_LW_FILE.exists():
         try:
             p = _GLOBAL_LW_FILE.read_text(encoding='utf-8').strip()
             if p and Path(p).is_dir():
-                return p
+                resolved = str(Path(p).expanduser().resolve())
+                try:
+                    from api.profiles import get_active_hermes_home
+                    own_dir = str(get_active_hermes_home().resolve())
+                    if resolved.startswith(own_dir):
+                        return resolved
+                except Exception:
+                    return resolved  # best-effort if profile lookup fails
         except Exception:
             logger.debug("Failed to read global last workspace")
+
+    # 4. Final fallback.
     return _profile_default_workspace()
 
 
