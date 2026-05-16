@@ -963,6 +963,18 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         worktree_repo_root=wt.get('repo_root') if wt else None,
         worktree_created_at=wt.get('created_at') if wt else None,
     )
+    # Multi-user: if admin pinned a global output language, auto-apply the
+    # _global_lang personality to every new session so the agent's first
+    # turn already speaks the right language. Per-session personality.set
+    # API still works for explicit user override. Best-effort: if config
+    # is unreadable, leave personality None and proceed.
+    try:
+        if not getattr(s, 'personality', None):
+            from api import global_config as _gc
+            if _gc.read_output_language() != 'auto':
+                s.personality = _gc.OUTPUT_LANGUAGE_PERSONALITY_NAME
+    except Exception:
+        pass
     with LOCK:
         SESSIONS[s.session_id] = s
         SESSIONS.move_to_end(s.session_id)

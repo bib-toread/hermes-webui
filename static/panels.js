@@ -7137,6 +7137,8 @@ async function loadAdminPanel(forceRefresh){
   const status = document.getElementById('adminUsersStatus');
   const wrap = document.getElementById('adminUsersTableWrap');
   if(!status || !wrap) return;
+  // Load output-language dropdown state in parallel with the user list.
+  adminLoadOutputLanguage();
   if(!forceRefresh && _adminUsersCache){
     adminRenderUsersTable(_adminUsersCache);
     return;
@@ -7153,6 +7155,58 @@ async function loadAdminPanel(forceRefresh){
     status.style.display = '';
     status.textContent = '加载失败：' + (e && e.message || e);
     status.style.color = '#ff5b6f';
+  }
+}
+
+async function adminLoadOutputLanguage(){
+  const sel = document.getElementById('adminOutputLanguage');
+  const stat = document.getElementById('adminOutputLanguageStatus');
+  if(!sel) return;
+  try{
+    const data = await api('/api/admin/output-language');
+    if(data && data.lang){
+      sel.value = data.lang;
+      if(stat) stat.textContent = data.lang === 'auto'
+        ? '当前：Auto（未强制）'
+        : `当前：${data.lang}`;
+    }
+  }catch(e){
+    if(stat){
+      stat.textContent = '读取失败：' + (e && e.message || e);
+      stat.style.color = '#ff5b6f';
+    }
+  }
+}
+
+async function adminSaveOutputLanguage(){
+  const sel = document.getElementById('adminOutputLanguage');
+  const stat = document.getElementById('adminOutputLanguageStatus');
+  const btn = document.getElementById('btnSaveOutputLanguage');
+  if(!sel || !btn) return;
+  const lang = sel.value;
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = '保存中…';
+  if(stat){ stat.style.color = 'var(--muted)'; stat.textContent = ''; }
+  try{
+    const data = await api('/api/admin/output-language', {
+      method: 'POST', body: JSON.stringify({ lang }),
+    });
+    if(stat){
+      stat.style.color = '#2bd68a';
+      const mirrored = (data && data.mirrored) || 0;
+      stat.textContent = lang === 'auto'
+        ? `✓ 已关闭语言强制（${mirrored} 个用户 profile 已同步）`
+        : `✓ 已设为 ${lang}（${mirrored} 个用户 profile 已同步，新会话立即生效）`;
+    }
+  }catch(e){
+    if(stat){
+      stat.style.color = '#ff5b6f';
+      stat.textContent = '保存失败：' + (e && e.message || e);
+    }
+  }finally{
+    btn.disabled = false;
+    btn.textContent = originalLabel;
   }
 }
 

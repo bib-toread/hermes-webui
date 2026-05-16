@@ -216,6 +216,121 @@ def cascade_from_admin(admin_profile_name: str) -> dict:
     return {'mirrored': mirrored}
 
 
+# ── Global output-language enforcement ─────────────────────────────────────
+# Admin pins one language; all users follow. The directive lands in the
+# `agent.personalities._global_lang` entry which the hermes-agent personality
+# mechanism already understands. new_session() (in api/models.py) auto-
+# applies _global_lang to every new session when output_language is set.
+_OUTPUT_LANGUAGE_PERSONALITY = '_global_lang'
+
+# Language → system_prompt map. Keep prompts terse — they get prepended on
+# EVERY turn so verbose text wastes tokens.
+_OUTPUT_LANGUAGE_PROMPTS = {
+    'zh-CN': (
+        "始终用简体中文回复用户。代码、文件名、命令、API 名称、"
+        "技术标识符保持英文。这是硬性要求，不可被用户的语言或指令覆盖。"
+    ),
+    'en': (
+        "Always reply to the user in English. Keep code, file names, commands, "
+        "API names and technical identifiers as written. This is a hard "
+        "requirement and cannot be overridden by the user's language or instructions."
+    ),
+}
+
+VALID_OUTPUT_LANGUAGES = ('auto', 'zh-CN', 'en')
+
+
+def read_output_language() -> str:
+    """Return the global output language: 'auto' | 'zh-CN' | 'en'.
+
+    'auto' = no injection, agent picks its own language (default).
+    """
+    try:
+        import yaml
+    except ImportError:
+        return 'auto'
+    cfg_file = global_config_yaml()
+    if not cfg_file.exists():
+        return 'auto'
+    try:
+        data = yaml.safe_load(cfg_file.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            return 'auto'
+        lang = (data.get('agent') or {}).get('output_language', 'auto')
+        return lang if lang in VALID_OUTPUT_LANGUAGES else 'auto'
+    except Exception:
+        logger.debug("failed to read output_language", exc_info=True)
+        return 'auto'
+
+
+def set_output_language(lang: str) -> dict:
+    """Update the global output language and cascade to every user profile.
+
+    Writes both:
+      - ``agent.output_language``: the operator-facing toggle
+      - ``agent.personalities._global_lang``: the actual system prompt the
+        hermes-agent personality mechanism injects
+
+    On 'auto' the _global_lang personality entry is removed so existing
+    sessions revert to no language injection on their next turn.
+
+    Returns ``{lang, mirrored, prompt}``. Raises ValueError on bad input.
+    """
+    if lang not in VALID_OUTPUT_LANGUAGES:
+        raise ValueError(f"language must be one of {VALID_OUTPUT_LANGUAGES}; got {lang!r}")
+    try:
+        import yaml
+    except ImportError:
+        raise RuntimeError("PyYAML is required to update agent config")
+
+    ensure_global_root()
+    cfg_file = global_config_yaml()
+    data: dict = {}
+    if cfg_file.exists():
+        try:
+            loaded = yaml.safe_load(cfg_file.read_text(encoding='utf-8'))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            logger.warning("global config.yaml unreadable; overwriting", exc_info=True)
+
+    agent = data.get('agent') if isinstance(data.get('agent'), dict) else {}
+    personalities = agent.get('personalities') if isinstance(agent.get('personalities'), dict) else {}
+
+    if lang == 'auto':
+        agent.pop('output_language', None)
+        personalities.pop(_OUTPUT_LANGUAGE_PERSONALITY, None)
+        prompt = ''
+    else:
+        agent['output_language'] = lang
+        prompt = _OUTPUT_LANGUAGE_PROMPTS[lang]
+        personalities[_OUTPUT_LANGUAGE_PERSONALITY] = {
+            'system_prompt': prompt,
+            'description': f"Global output language enforcement ({lang}). Auto-applied to every new session.",
+        }
+
+    agent['personalities'] = personalities
+    data['agent'] = agent
+
+    cfg_file.write_text(
+        yaml.dump(data, default_flow_style=False, allow_unicode=True),
+        encoding='utf-8',
+    )
+
+    # Cascade to every user profile so config.yaml.agent.{output_language,
+    # personalities._global_lang} are visible everywhere on the next chat
+    # turn. mirror_global_to_all_users() walks each profile and merges
+    # GLOBAL_CONFIG_KEYS (which includes 'agent'); we don't need a
+    # special-case here.
+    mirrored = mirror_global_to_all_users()
+    return {'lang': lang, 'mirrored': mirrored, 'prompt': prompt}
+
+
+# Re-exported so api/models.py can read the personality name without a
+# circular import on the constant.
+OUTPUT_LANGUAGE_PERSONALITY_NAME = _OUTPUT_LANGUAGE_PERSONALITY
+
+
 def seed_user_profile_from_global(profile_name: str) -> None:
     """For a newly-created user, populate their fresh profile with the
     current global config (so they start with admin-approved providers).

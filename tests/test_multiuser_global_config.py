@@ -251,5 +251,73 @@ class TestSeedUserProfile(unittest.TestCase):
         self.assertFalse(cfg.exists())
 
 
+@unittest.skipUnless(_has_yaml(), "PyYAML not installed")
+class TestOutputLanguage(unittest.TestCase):
+    """Admin-pinned global output language: read/write + personality plant
+    + auto cascade to per-user profiles. See api/global_config.py."""
+
+    def setUp(self):
+        users.ensure_schema()
+        _reset()
+        # Need at least one non-admin so mirror has something to cascade to.
+        users.create_user('admin', 'pw1234', role='admin',
+                          profile_name='user_admin')
+        users.create_user('bob', 'pw1234', role='user',
+                          profile_name='user_bob')
+        _profile_dir('user_admin')
+        _profile_dir('user_bob')
+
+    def test_default_is_auto(self):
+        self.assertEqual(gc.read_output_language(), 'auto')
+
+    def test_set_zh_writes_global_and_plants_personality(self):
+        result = gc.set_output_language('zh-CN')
+        self.assertEqual(result['lang'], 'zh-CN')
+        self.assertGreaterEqual(result['mirrored'], 1)
+        # Roundtrip
+        self.assertEqual(gc.read_output_language(), 'zh-CN')
+        # The _global_lang personality must exist in global config.yaml
+        import yaml
+        data = yaml.safe_load(gc.global_config_yaml().read_text(encoding='utf-8'))
+        agent = data['agent']
+        self.assertEqual(agent['output_language'], 'zh-CN')
+        self.assertIn(gc.OUTPUT_LANGUAGE_PERSONALITY_NAME, agent['personalities'])
+        prompt = agent['personalities'][gc.OUTPUT_LANGUAGE_PERSONALITY_NAME]['system_prompt']
+        self.assertIn('中文', prompt)
+
+    def test_set_en(self):
+        gc.set_output_language('en')
+        import yaml
+        data = yaml.safe_load(gc.global_config_yaml().read_text(encoding='utf-8'))
+        prompt = data['agent']['personalities'][gc.OUTPUT_LANGUAGE_PERSONALITY_NAME]['system_prompt']
+        self.assertIn('English', prompt)
+
+    def test_set_auto_removes_personality(self):
+        gc.set_output_language('zh-CN')        # plant it
+        gc.set_output_language('auto')          # remove it
+        import yaml
+        data = yaml.safe_load(gc.global_config_yaml().read_text(encoding='utf-8'))
+        agent = data.get('agent', {})
+        self.assertNotIn('output_language', agent)
+        self.assertNotIn(gc.OUTPUT_LANGUAGE_PERSONALITY_NAME,
+                         agent.get('personalities', {}))
+
+    def test_set_cascades_to_user_profile(self):
+        gc.set_output_language('zh-CN')
+        import yaml
+        bob_cfg = _TEST_STATE / 'profiles' / 'user_bob' / 'config.yaml'
+        self.assertTrue(bob_cfg.exists())
+        data = yaml.safe_load(bob_cfg.read_text(encoding='utf-8'))
+        self.assertEqual(data['agent']['output_language'], 'zh-CN')
+        self.assertIn(gc.OUTPUT_LANGUAGE_PERSONALITY_NAME,
+                      data['agent']['personalities'])
+
+    def test_invalid_lang_rejected(self):
+        with self.assertRaises(ValueError):
+            gc.set_output_language('fr')
+        with self.assertRaises(ValueError):
+            gc.set_output_language('')
+
+
 if __name__ == '__main__':
     unittest.main()

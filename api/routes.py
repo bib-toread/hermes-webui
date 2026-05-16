@@ -3672,6 +3672,15 @@ def handle_get(handler, parsed) -> bool:
         from api.admin_users import handle_admin_usage
         return handle_admin_usage(handler, parsed)
 
+    if parsed.path == "/api/admin/output-language":
+        if not _admin_or_403(handler):
+            return True
+        from api import global_config as _gc
+        return j(handler, {
+            'lang': _gc.read_output_language(),
+            'options': list(_gc.VALID_OUTPUT_LANGUAGES),
+        })
+
     if parsed.path == "/login":
         # The 筑保-design template is hardcoded zh-CN and uses only three
         # template variables: WEBUI_VERSION (cache-bust + footer) and the
@@ -5595,6 +5604,19 @@ def handle_post(handler, parsed) -> bool:
             return True
         from api.admin_users import handle_admin_users_post
         return handle_admin_users_post(handler, parsed, body)
+
+    if parsed.path == "/api/admin/output-language":
+        if not _admin_or_403(handler):
+            return True
+        lang = (body or {}).get('lang', '').strip()
+        try:
+            from api import global_config as _gc
+            result = _gc.set_output_language(lang)
+        except ValueError as e:
+            return bad(handler, str(e), status=400)
+        except RuntimeError as e:
+            return bad(handler, str(e), status=500)
+        return j(handler, result)
 
     # ── Profile API (POST) ──
     if parsed.path == "/api/profile/switch":
