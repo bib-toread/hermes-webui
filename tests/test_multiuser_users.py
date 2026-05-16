@@ -423,6 +423,67 @@ class TestSeedDefaultWorkspace(unittest.TestCase):
             str((self.profile_home / 'workspace').resolve()),
         )
 
+    def test_sync_profile_skills_to_global_copies_all_skills(self):
+        """sync_profile_skills_to_global should copy every skill (with
+        linked files) from a profile's skills/ into ~/.hermes/global/skills/,
+        preserving the <category>/<name> layout."""
+        from api.global_skills import sync_profile_skills_to_global, global_skills_dir
+        skills_dir = self.profile_home / 'skills'
+        # Direct-at-root skill: <skills>/<name>/SKILL.md
+        direct = skills_dir / 'standalone-skill'
+        direct.mkdir(parents=True, exist_ok=True)
+        (direct / 'SKILL.md').write_text('# standalone', encoding='utf-8')
+        (direct / 'helper.txt').write_text('linked file', encoding='utf-8')
+        # Category skill: <skills>/<cat>/<name>/SKILL.md
+        cat_skill = skills_dir / 'BUSINESS' / 'policy-doc'
+        cat_skill.mkdir(parents=True, exist_ok=True)
+        (cat_skill / 'SKILL.md').write_text('# policy', encoding='utf-8')
+
+        result = sync_profile_skills_to_global('user_seedtest')
+        self.assertEqual(result['count'], 2)
+        self.assertEqual(result['skipped'], [])
+        self.assertIn('standalone-skill', result['synced'])
+        self.assertIn('BUSINESS/policy-doc', result['synced'])
+
+        gdir = global_skills_dir()
+        # Standalone skill + its linked file copied
+        self.assertTrue((gdir / 'standalone-skill' / 'SKILL.md').exists())
+        self.assertTrue((gdir / 'standalone-skill' / 'helper.txt').exists())
+        self.assertEqual(
+            (gdir / 'standalone-skill' / 'helper.txt').read_text(encoding='utf-8'),
+            'linked file',
+        )
+        # Category skill preserves the BUSINESS/policy-doc layout
+        self.assertTrue((gdir / 'BUSINESS' / 'policy-doc' / 'SKILL.md').exists())
+
+    def test_sync_overwrites_existing_global_same_name(self):
+        """Re-pushing a skill must overwrite the global version."""
+        from api.global_skills import sync_profile_skills_to_global, global_skills_dir
+        skills_dir = self.profile_home / 'skills'
+        gdir = global_skills_dir()
+        # Pre-existing global skill with old content
+        (gdir / 'test-overwrite').mkdir(parents=True, exist_ok=True)
+        (gdir / 'test-overwrite' / 'SKILL.md').write_text('OLD', encoding='utf-8')
+        # Admin has a newer version
+        (skills_dir / 'test-overwrite').mkdir(parents=True, exist_ok=True)
+        (skills_dir / 'test-overwrite' / 'SKILL.md').write_text('NEW', encoding='utf-8')
+        sync_profile_skills_to_global('user_seedtest')
+        self.assertEqual(
+            (gdir / 'test-overwrite' / 'SKILL.md').read_text(encoding='utf-8'),
+            'NEW',
+        )
+
+    def test_sync_preserves_global_only_skills(self):
+        """Skills that exist ONLY in global (admin doesn't have locally)
+        must not be deleted — merge semantics, not mirror semantics."""
+        from api.global_skills import sync_profile_skills_to_global, global_skills_dir
+        gdir = global_skills_dir()
+        (gdir / 'admin-doesnt-have').mkdir(parents=True, exist_ok=True)
+        (gdir / 'admin-doesnt-have' / 'SKILL.md').write_text('keep me', encoding='utf-8')
+        # Admin pushes empty skills/ dir
+        sync_profile_skills_to_global('user_seedtest')
+        self.assertTrue((gdir / 'admin-doesnt-have' / 'SKILL.md').exists())
+
     def test_terminal_cwd_seed_preserves_other_keys(self):
         """Re-seeding must not blow away existing top-level keys in config.yaml
         (e.g. model, custom_providers that came from global mirror)."""

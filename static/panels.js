@@ -7178,6 +7178,51 @@ async function adminLoadOutputLanguage(){
   }
 }
 
+async function adminSyncSkillsToGlobal(){
+  const btn = document.getElementById('btnSyncSkillsToGlobal');
+  const stat = document.getElementById('adminSyncSkillsStatus');
+  if(!btn) return;
+  const ok = confirm(
+    '将你（admin）profile 中的所有技能复制到全局共享目录。\n\n'
+    + '• 所有用户立即可见\n'
+    + '• 同名技能会被覆盖（用你的当前版本）\n'
+    + '• 全局中你本地没有的技能不会被删除\n\n'
+    + '确认继续？'
+  );
+  if(!ok) return;
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = '推送中…';
+  if(stat){ stat.style.color = 'var(--muted)'; stat.textContent = ''; }
+  try{
+    const data = await api('/api/admin/skills/sync-to-global', {
+      method: 'POST', body: '{}',
+    });
+    const count = (data && data.count) || 0;
+    const skipped = (data && data.skipped) || [];
+    if(stat){
+      if(count === 0 && skipped.length === 0){
+        stat.style.color = 'var(--muted)';
+        stat.textContent = '没有可推送的技能（admin profile 的 skills/ 目录为空）';
+      }else if(skipped.length === 0){
+        stat.style.color = '#2bd68a';
+        stat.textContent = `✓ 已推送 ${count} 个技能到全局（所有用户可见）`;
+      }else{
+        stat.style.color = '#e8a030';
+        stat.textContent = `部分成功：${count} 个推送成功，${skipped.length} 个失败 — ${skipped.map(s => s.name || s).join(', ')}`;
+      }
+    }
+  }catch(e){
+    if(stat){
+      stat.style.color = '#ff5b6f';
+      stat.textContent = '推送失败：' + (e && e.message || e);
+    }
+  }finally{
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
 async function adminSaveOutputLanguage(){
   const sel = document.getElementById('adminOutputLanguage');
   const stat = document.getElementById('adminOutputLanguageStatus');

@@ -5619,6 +5619,26 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e), status=500)
         return j(handler, result)
 
+    if parsed.path == "/api/admin/skills/sync-to-global":
+        # Push every skill in the requesting admin's profile skills/ dir
+        # to ~/.hermes/global/skills/ so all users see them. Merge
+        # semantics — global-only skills (admin doesn't have locally) are
+        # untouched. Skills with the same name in global get overwritten
+        # with the admin's current version.
+        if not _admin_or_403(handler):
+            return True
+        from api.auth import current_user as _cur_user
+        admin_user = _cur_user(handler)
+        if not admin_user:
+            return bad(handler, "admin user not resolvable", status=500)
+        from api.global_skills import sync_profile_skills_to_global
+        try:
+            result = sync_profile_skills_to_global(admin_user['profile_name'])
+        except Exception as exc:
+            logger.exception("sync_profile_skills_to_global failed")
+            return bad(handler, str(exc), status=500)
+        return j(handler, result)
+
     # ── Profile API (POST) ──
     if parsed.path == "/api/profile/switch":
         # Multi-user: profile switching is disabled. Each user is pinned to

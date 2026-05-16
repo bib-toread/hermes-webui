@@ -1249,6 +1249,22 @@
               <div id="adminOutputLanguageStatus" style="font-size:11px;color:var(--muted);margin-top:6px;min-height:14px"></div>
             </div>
 
+            <!-- ── 全局技能同步（admin 推送自己的技能给所有用户）─────── -->
+            <div class="settings-field" style="margin-bottom:18px;padding:12px 14px;background:var(--code-bg);border:1px solid var(--border);border-radius:10px">
+              <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;margin-bottom:6px">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v6m0 0l-3-3m3 3l3-3M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg>
+                <span>推送技能到全局</span>
+              </label>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+                把你（admin）profile 里的所有技能复制到全局共享目录 <code style="font-family:var(--mono,monospace);background:var(--bg,#0e1a33);padding:1px 5px;border-radius:4px">~/.hermes/global/skills/</code>，所有用户立即可见。
+                <b>同名覆盖</b>，<b>不删除</b>全局中你本地没有的技能（合并语义）。
+              </div>
+              <button type="button" class="sm-btn" id="btnSyncSkillsToGlobal" onclick="adminSyncSkillsToGlobal()" style="font-weight:600">
+                推送我的所有技能到全局
+              </button>
+              <div id="adminSyncSkillsStatus" style="font-size:11px;color:var(--muted);margin-top:6px;min-height:14px"></div>
+            </div>
+
             <div id="adminUsersStatus" style="font-size:12px;color:var(--muted);margin-bottom:8px">加载中…</div>
             <div id="adminUsersTableWrap" class="admin-table-wrap"></div>
           </div>
