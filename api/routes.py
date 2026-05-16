@@ -91,6 +91,58 @@ _CSP_REPORT_MAX_BODY_BYTES = 64 * 1024
 from api.profiles import _profiles_match  # noqa: F401, E402  (re-export)
 
 
+# Multi-user admin path patterns used by the GET/POST/PATCH/DELETE dispatch.
+_ADMIN_USER_ID_PATH_RE = re.compile(r'^/api/admin/users/\d+$')
+_ADMIN_USAGE_ID_PATH_RE = re.compile(r'^/api/admin/usage/\d+$')
+
+
+def _admin_or_403(handler) -> bool:
+    """Return True iff the request is from an admin; else send 403 and return False.
+
+    Used to gate every "system configuration" endpoint (providers, custom relays,
+    default model, reasoning, crons, onboarding setup, brand/bot name, etc.).
+    """
+    from api.auth import current_user
+    u = current_user(handler)
+    if u and u.get('role') == 'admin':
+        return True
+    from api.helpers import bad as _bad
+    _bad(handler, "admin only", status=403)
+    return False
+
+
+# NOTE: an earlier design tried per-key admin gating on /api/settings via a
+# `_ADMIN_SETTINGS_KEYS` frozenset, then collapsed to whole-endpoint admin-
+# only because settings.json is a process-global file (every key affects
+# every user). The set was left behind as dead code; removed (#review-fix
+# bug_033). If per-user personal-pref keys (theme, lang, sidebar) ever
+# need to live server-side, add a SEPARATE per-profile endpoint rather
+# than re-introducing per-key dispatch in /api/settings.
+
+
+def _mirror_global_config_after_admin_write() -> None:
+    """Eagerly propagate admin-side config changes to every user's profile.
+
+    Hooks the existing setters (set_provider_key, upsert_custom_relay,
+    set_hermes_default_model, set_reasoning_*). Those setters all write to
+    ``$HERMES_HOME`` resolved via thread-local profile — which for an admin
+    request points at the admin's own profile. We snapshot that admin
+    profile to ``~/.hermes/global/`` then cascade to every other user
+    profile so the next chat turn picks up the change.
+
+    Best-effort: any failure is logged at debug level and silently swallowed,
+    because mirroring is a propagation optimisation — the admin's own
+    profile already has the correct value before we get here.
+    """
+    try:
+        from api.profiles import get_active_profile_name
+        from api import global_config as _gc
+        admin_profile = get_active_profile_name()
+        _gc.cascade_from_admin(admin_profile)
+    except Exception:
+        logger.debug("global config mirror failed", exc_info=True)
+
+
 def _all_profiles_query_flag(parsed_url) -> bool:
     """Return True if the request URL has `?all_profiles=1` (or true/yes).
 
@@ -147,6 +199,14 @@ def _skill_category_from_path(skill_md: Path, skills_dirs: list[Path]) -> str | 
 
 def _active_skill_search_dirs(skills_dir: Path) -> list[Path]:
     dirs = [skills_dir]
+    # Multi-user: surface admin-curated global skills (~/.hermes/global/skills)
+    # to every user. Listed AFTER the user's own dir so a user override of the
+    # same name wins the dedup in _skills_list_from_dir.
+    try:
+        from api.global_skills import global_skills_dir as _gsd
+        dirs.append(_gsd())
+    except Exception:
+        pass
     try:
         from agent.skill_utils import get_external_skills_dirs
 
@@ -238,11 +298,17 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
                 if len(description) > MAX_DESCRIPTION_LENGTH:
                     description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
                 seen_names.add(name)
+                try:
+                    from api.global_skills import scope_of_path
+                    _scope = scope_of_path(skill_md)
+                except Exception:
+                    _scope = "user"
                 all_skills.append(
                     {
                         "name": name,
                         "description": description,
                         "category": _skill_category_from_path(skill_md, search_dirs),
+                        "scope": _scope,
                     }
                 )
             except (UnicodeDecodeError, PermissionError) as e:
@@ -2306,41 +2372,451 @@ def _resolve_login_locale_key(raw_lang: str | None) -> str:
             return key
     return "en"
 
-# ── Login page (self-contained, no external deps) ────────────────────────────
+# ── Login page (自封闭设计，无外部依赖；筑保事故预防 Agent 原型) ─────────────
+# Visual identity sourced from the Claude Design handoff bundle
+# (sky-blue light theme · dataviz radar background · hex agent mark with 筑
+# glyph · glass card with corner reticles). The React/JSX prototype was
+# inlined into pure HTML + CSS + SVG so the page ships with no build step.
+#
+# Template placeholders honoured:
+#   {{WEBUI_VERSION}}        — cache-bust login.js
+#   {{LOGIN_INVALID_PW}}     — read by login.js via data-invalid-pw
+#   {{LOGIN_CONN_FAILED}}    — read by login.js via data-conn-failed
+# All other brand text is hardcoded zh-CN per the design intent.
 _LOGIN_PAGE_HTML = """<!doctype html>
-<html lang="{{LANG}}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{BOT_NAME}} — {{LOGIN_TITLE}}</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>筑保事故预防 Agent · 登录</title>
+<!--
+  Fonts: NO third-party CDN. Earlier revisions linked fonts.googleapis.com,
+  which (a) violated the self-served-asset CSP this app ships, (b) leaked
+  visitor IP/UA/Referer to Google on every login GET, and (c) hung for the
+  preconnect timeout in air-gapped deployments — the exact environments
+  most likely to enable an auth wall. Fall back to the platform Han stack:
+  PingFang on macOS/iOS, HarmonyOS Sans / Microsoft YaHei on Windows,
+  Noto Sans CJK SC if installed locally. (#review-fix bug_013)
+-->
 <style>
+:root {
+  --bg-0:#eaf4ff; --bg-1:#dceaff; --bg-2:#ffffff;
+  --panel: rgba(14,165,233,0.04);
+  --panel-2: rgba(14,165,233,0.08);
+  --border: rgba(14,100,180,0.15);
+  --border-strong: rgba(14,100,180,0.28);
+  --text:#0b2c4d; --text-soft:#2c4f78; --text-dim:#5c7798; --text-faint:#97aac4;
+  --accent:#0ea5e9;
+  --accent-soft: rgba(14,165,233,0.16);
+  --accent-glow: rgba(14,165,233,0.35);
+  --ok:#2bd68a; --danger:#ff5b6f;
+  --mono:"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans:"Noto Sans SC", "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", system-ui, sans-serif;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#1a1a2e;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
-  height:100vh;display:flex;align-items:center;justify-content:center}
-.card{background:#16213e;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:36px 32px;
-  width:320px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.3)}
-.logo{width:48px;height:48px;border-radius:12px;background:linear-gradient(145deg,#e8a030,#e94560);
-  display:flex;align-items:center;justify-content:center;font-weight:800;font-size:20px;color:#fff;
-  margin:0 auto 12px;box-shadow:0 2px 12px rgba(233,69,96,.3)}
-h1{font-size:18px;font-weight:600;margin-bottom:4px}
-.sub{font-size:12px;color:#8888aa;margin-bottom:24px}
-input{width:100%;padding:10px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);
-  background:rgba(255,255,255,.04);color:#e8e8f0;font-size:14px;outline:none;margin-bottom:14px;
-  transition:border-color .15s}
-input:focus{border-color:rgba(124,185,255,.5);box-shadow:0 0 0 3px rgba(124,185,255,.1)}
-button{width:100%;padding:10px;border-radius:10px;border:none;background:rgba(124,185,255,.15);
-  border:1px solid rgba(124,185,255,.3);color:#7cb9ff;font-size:14px;font-weight:600;cursor:pointer;
-  transition:all .15s}
-button:hover{background:rgba(124,185,255,.25)}
-.err{color:#e94560;font-size:12px;margin-top:10px;display:none}
+html,body{margin:0;padding:0}
+body{
+  font-family:var(--sans); background:var(--bg-0); color:var(--text);
+  min-height:100vh; overflow:hidden; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
+}
+.app{
+  position:relative; width:100vw; height:100vh; overflow:hidden;
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 0%, #ffffff 0%, rgba(255,255,255,0) 60%),
+    radial-gradient(circle at 15% 25%, rgba(125,211,252,.55), transparent 50%),
+    radial-gradient(circle at 85% 75%, rgba(56,189,248,.40), transparent 55%),
+    linear-gradient(180deg, #c7e3ff 0%, #e8f3ff 55%, #f7fbff 100%);
+}
+.bg-layer{position:absolute; inset:0; pointer-events:none; z-index:0}
+
+/* center stage */
+.center-stage{
+  position:relative; z-index:2; min-height:100vh;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:56px; padding:60px 24px 80px;
+}
+.brand-head{display:flex; flex-direction:column; align-items:center; gap:18px; text-align:center; max-width:560px}
+.agent-glyph{width:120px; height:120px}
+.brand-text{display:flex; flex-direction:column; align-items:center; gap:8px}
+.brand-eyebrow{
+  font-family:var(--mono); font-size:10.5px; color:var(--accent);
+  letter-spacing:.28em; text-transform:uppercase; white-space:nowrap;
+  display:inline-flex; align-items:center; gap:12px;
+}
+.brand-eyebrow::before, .brand-eyebrow::after{
+  content:""; width:32px; height:1px;
+  background:linear-gradient(90deg, transparent, var(--accent), transparent);
+}
+.brand-title{
+  margin:4px 0 0; font-size:34px; font-weight:600; letter-spacing:.04em;
+  line-height:1.15; white-space:nowrap;
+  background:linear-gradient(180deg, #0b2c4d 0%, #2c4f78 100%);
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+}
+.brand-title .agent-en{
+  font-family:var(--mono); font-weight:400; letter-spacing:.12em;
+  margin-left:.5em; color:var(--accent); -webkit-text-fill-color:var(--accent);
+  font-size:.82em; vertical-align:2px;
+}
+
+/* login card */
+.login{
+  width:100%; max-width:420px; padding:38px 36px 32px;
+  border:1px solid var(--border-strong); border-radius:16px;
+  background: rgba(255,255,255,.78);
+  backdrop-filter: blur(24px) saturate(140%);
+  -webkit-backdrop-filter: blur(24px) saturate(140%);
+  box-shadow: 0 1px 0 rgba(255,255,255,1) inset, 0 30px 80px -28px rgba(14,100,180,.32), 0 0 0 1px rgba(14,100,180,.05);
+  position:relative;
+}
+.login::before{
+  content:""; position:absolute; inset:-1px; border-radius:17px; padding:1px;
+  background: linear-gradient(135deg, var(--accent-glow) 0%, transparent 45%, transparent 65%, rgba(74,194,255,.25) 100%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+  pointer-events:none; opacity:.8;
+}
+.login-corner{position:absolute; width:14px; height:14px; border:1px solid var(--accent); opacity:.65}
+.login-corner.tl{top:-1px; left:-1px; border-right:0; border-bottom:0}
+.login-corner.tr{top:-1px; right:-1px; border-left:0; border-bottom:0}
+.login-corner.bl{bottom:-1px; left:-1px; border-right:0; border-top:0}
+.login-corner.br{bottom:-1px; right:-1px; border-left:0; border-top:0}
+
+.field{margin-bottom:16px}
+.field-lbl{
+  display:block; margin-bottom:7px; font-size:11px; color:var(--text-dim);
+  letter-spacing:.12em; text-transform:uppercase; font-family:var(--mono);
+}
+.input-shell{
+  position:relative; display:flex; align-items:center;
+  border:1px solid var(--border-strong); border-radius:10px;
+  background: rgba(20,40,80,0.03);
+  transition: border-color .18s, box-shadow .18s;
+}
+.input-shell:focus-within{
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.input-shell .ic{width:40px; display:grid; place-items:center; color:var(--text-dim)}
+.input-shell input{
+  flex:1; min-width:0; background:transparent; border:0; outline:0;
+  font:inherit; font-family:var(--sans); font-size:14px;
+  color:var(--text); padding:13px 12px 13px 0;
+}
+.input-shell input::placeholder{color:var(--text-faint)}
+.input-shell .toggle-vis{
+  background:transparent; border:0; color:var(--text-dim);
+  padding:0 14px; cursor:pointer; height:100%; display:grid; place-items:center;
+}
+.input-shell .toggle-vis:hover{color:var(--text)}
+
+.btn-primary{
+  width:100%; margin-top:10px;
+  display:inline-flex; align-items:center; justify-content:center; gap:10px;
+  white-space:nowrap; background:var(--accent); color:#ffffff;
+  border:0; font-family:var(--sans); font-weight:600; font-size:14.5px; letter-spacing:.06em;
+  padding:14px 18px; border-radius:10px; cursor:pointer;
+  position:relative; overflow:hidden;
+  box-shadow: 0 8px 24px -8px var(--accent-glow);
+  transition: transform .12s, box-shadow .2s;
+}
+.btn-primary:hover{transform:translateY(-1px); box-shadow:0 12px 32px -10px var(--accent-glow)}
+.btn-primary:active{transform:translateY(0)}
+.btn-primary[disabled]{opacity:.6; cursor:not-allowed}
+.btn-primary .arrow{display:inline-flex; align-items:center; transition:transform .2s}
+.btn-primary:hover .arrow{transform:translateX(3px)}
+
+.err{
+  display:none; margin-top:14px; padding:10px 14px;
+  background: rgba(255,91,111,.08); border:1px solid rgba(255,91,111,.28);
+  color: var(--danger); border-radius:10px; font-size:12.5px; text-align:center;
+  letter-spacing:.02em;
+}
+
+.mini-footer{
+  position:absolute; left:0; right:0; bottom:22px; z-index:4;
+  display:flex; align-items:center; justify-content:center; gap:12px;
+  font-family:var(--mono); font-size:10.5px; color:var(--text-faint); letter-spacing:.14em;
+}
+.mini-footer .sep{color:var(--text-faint); opacity:.5}
+
+/* agent-mark animations */
+.av-ring{animation: av-rot 14s linear infinite; transform-origin:50% 50%}
+.av-ring-rev{animation: av-rot 22s linear infinite reverse; transform-origin:50% 50%}
+.av-pulse{animation: av-pulse 3.2s ease-in-out infinite; transform-origin:50% 50%}
+.scan-sweep{animation: scan 5s cubic-bezier(.4,0,.4,1) infinite; transform-origin:50% 50%}
+@keyframes av-rot{to{transform:rotate(360deg)}}
+@keyframes av-pulse{0%,100%{opacity:.35; transform:scale(1)} 50%{opacity:.9; transform:scale(1.06)}}
+@keyframes scan{to{transform:rotate(360deg)}}
 </style></head><body>
-<div class="card">
-  <div class="logo">{{BOT_NAME_INITIAL}}</div>
-  <h1>{{BOT_NAME}}</h1>
-  <p class="sub">{{LOGIN_SUBTITLE}}</p>
-  <form id="login-form" data-invalid-pw="{{LOGIN_INVALID_PW}}" data-conn-failed="{{LOGIN_CONN_FAILED}}">
-    <input type="password" id="pw" placeholder="{{LOGIN_PLACEHOLDER}}" autofocus>
-    <button type="submit">{{LOGIN_BTN}}</button>
-  </form>
-  <div class="err" id="err"></div>
+
+<div class="app">
+
+  <!-- ─── data-viz background ───────────────────────────────────── -->
+  <div class="bg-layer" aria-hidden="true">
+    <svg width="100%" height="100%" style="position:absolute;inset:0">
+      <defs>
+        <pattern id="grid-fine" width="32" height="32" patternUnits="userSpaceOnUse">
+          <path d="M 32 0 L 0 0 0 32" fill="none" stroke="rgba(14,100,180,0.08)" stroke-width="0.5"/>
+        </pattern>
+        <pattern id="grid-coarse" width="160" height="160" patternUnits="userSpaceOnUse">
+          <path d="M 160 0 L 0 0 0 160" fill="none" stroke="rgba(14,100,180,0.12)" stroke-width="0.7"/>
+        </pattern>
+      </defs>
+      <rect width="100%" height="100%" fill="url(#grid-fine)"/>
+      <rect width="100%" height="100%" fill="url(#grid-coarse)"/>
+    </svg>
+
+    <!-- radar on right -->
+    <svg width="640" height="640" style="position:absolute;right:-180px;top:8%;opacity:.6" viewBox="-100 -100 200 200">
+      <defs>
+        <radialGradient id="radar-fade">
+          <stop offset="0%" stop-color="rgba(14,100,180,0.10)"/>
+          <stop offset="100%" stop-color="rgba(14,100,180,0)"/>
+        </radialGradient>
+        <linearGradient id="radar-sweep" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0"/>
+          <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0.5"/>
+        </linearGradient>
+      </defs>
+      <circle cx="0" cy="0" r="20" fill="none" stroke="rgba(14,100,180,0.28)" stroke-width="0.4"/>
+      <circle cx="0" cy="0" r="40" fill="none" stroke="rgba(14,100,180,0.28)" stroke-width="0.4"/>
+      <circle cx="0" cy="0" r="60" fill="none" stroke="rgba(14,100,180,0.28)" stroke-width="0.4"/>
+      <circle cx="0" cy="0" r="80" fill="none" stroke="rgba(14,100,180,0.28)" stroke-width="0.4"/>
+      <line x1="-90" y1="0" x2="90" y2="0" stroke="rgba(14,100,180,0.20)" stroke-width="0.4"/>
+      <line x1="0" y1="-90" x2="0" y2="90" stroke="rgba(14,100,180,0.20)" stroke-width="0.4"/>
+      <circle cx="0" cy="0" r="84" fill="url(#radar-fade)"/>
+      <g class="scan-sweep">
+        <path d="M 0 0 L 84 0 A 84 84 0 0 1 59.4 -59.4 Z" fill="url(#radar-sweep)" opacity="0.5"/>
+      </g>
+      <g>
+        <circle cx="22" cy="-15" r="1.2" fill="#0ea5e9" opacity="0.9"/>
+        <circle cx="22" cy="-15" r="3" fill="none" stroke="#0ea5e9" stroke-width="0.3" opacity="0.45">
+          <animate attributeName="r" values="1.5;5;1.5" dur="2.4s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="0.6;0;0.6" dur="2.4s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="-28" cy="32" r="1.2" fill="#0ea5e9" opacity="0.9"/>
+        <circle cx="-28" cy="32" r="3" fill="none" stroke="#0ea5e9" stroke-width="0.3" opacity="0.45">
+          <animate attributeName="r" values="1.5;5;1.5" dur="3.2s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="0.6;0;0.6" dur="3.2s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="55" cy="18" r="1.2" fill="#0ea5e9" opacity="0.9"/>
+        <circle cx="55" cy="18" r="3" fill="none" stroke="#0ea5e9" stroke-width="0.3" opacity="0.45">
+          <animate attributeName="r" values="1.5;5;1.5" dur="4s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="0.6;0;0.6" dur="4s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="-48" cy="-22" r="1.2" fill="#0ea5e9" opacity="0.9"/>
+        <circle cx="-48" cy="-22" r="3" fill="none" stroke="#0ea5e9" stroke-width="0.3" opacity="0.45">
+          <animate attributeName="r" values="1.5;5;1.5" dur="3.6s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="0.6;0;0.6" dur="3.6s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="12" cy="60" r="1.2" fill="#0ea5e9" opacity="0.9"/>
+        <circle cx="12" cy="60" r="3" fill="none" stroke="#0ea5e9" stroke-width="0.3" opacity="0.45">
+          <animate attributeName="r" values="1.5;5;1.5" dur="4.4s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="0.6;0;0.6" dur="4.4s" repeatCount="indefinite"/>
+        </circle>
+      </g>
+    </svg>
+
+    <!-- waveform along the bottom-left -->
+    <svg width="560" height="180" style="position:absolute;left:-40px;bottom:8%;opacity:.5" viewBox="0 0 560 180" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="wave-grad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.35"/>
+          <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      <path d="M 0 120 Q 60 80 120 100 T 240 90 T 360 110 T 480 70 T 560 95 L 560 180 L 0 180 Z" fill="url(#wave-grad)"/>
+      <path d="M 0 120 Q 60 80 120 100 T 240 90 T 360 110 T 480 70 T 560 95" fill="none" stroke="#0ea5e9" stroke-width="1" opacity="0.7"/>
+      <path d="M 0 140 Q 80 100 160 130 T 320 115 T 480 130 T 560 110" fill="none" stroke="rgba(14,100,180,0.55)" stroke-width="0.8"/>
+    </svg>
+  </div>
+
+  <!-- ─── center stage ──────────────────────────────────────────── -->
+  <div class="center-stage">
+
+    <div class="brand-head">
+      <div class="agent-glyph">
+        <!-- agent-mark SVG: hex outer ring (rotating), mid ring + ticks (counter-rotating),
+             inner hex frame with 筑 glyph, corner reticles, scan sweep. -->
+        <svg width="120" height="120" viewBox="-100 -100 200 200" style="display:block;overflow:visible" aria-label="筑保 agent">
+          <defs>
+            <radialGradient id="am-core" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.55"/>
+              <stop offset="55%" stop-color="#0ea5e9" stop-opacity="0.12"/>
+              <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0"/>
+            </radialGradient>
+            <linearGradient id="am-hex" x1="0" y1="-1" x2="0" y2="1">
+              <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.9"/>
+              <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0.35"/>
+            </linearGradient>
+          </defs>
+          <!-- halo -->
+          <circle cx="0" cy="0" r="92" fill="url(#am-core)" class="av-pulse"/>
+          <!-- outer hex ring, rotating -->
+          <g class="av-ring">
+            <polygon points="0,-78 67.5,-39 67.5,39 0,78 -67.5,39 -67.5,-39" fill="none" stroke="url(#am-hex)" stroke-width="1.2"/>
+            <circle cx="0"     cy="-78"  r="2.2" fill="#0ea5e9"/>
+            <circle cx="67.5"  cy="-39"  r="2.2" fill="#0ea5e9"/>
+            <circle cx="67.5"  cy="39"   r="2.2" fill="#0ea5e9"/>
+            <circle cx="0"     cy="78"   r="2.2" fill="#0ea5e9"/>
+            <circle cx="-67.5" cy="39"   r="2.2" fill="#0ea5e9"/>
+            <circle cx="-67.5" cy="-39"  r="2.2" fill="#0ea5e9"/>
+          </g>
+          <!-- mid ring with 36 ticks, counter-rotating -->
+          <g class="av-ring-rev">
+            <circle cx="0" cy="0" r="56" fill="none" stroke="rgba(14,100,180,0.35)" stroke-width="0.6"/>
+            <g stroke="rgba(14,100,180,0.55)" stroke-width="0.6">
+              <line x1="0" y1="-56" x2="0" y2="-62"/>
+              <line x1="9.7" y1="-55.2" x2="10.2" y2="-58.2"/>
+              <line x1="19.1" y1="-52.7" x2="20.2" y2="-55.7"/>
+              <line x1="28" y1="-48.5" x2="31" y2="-53.7"/>
+              <line x1="36" y1="-43" x2="38.1" y2="-45.4"/>
+              <line x1="43" y1="-36" x2="45.4" y2="-38.1"/>
+              <line x1="48.5" y1="-28" x2="53.7" y2="-31"/>
+              <line x1="52.7" y1="-19.1" x2="55.7" y2="-20.2"/>
+              <line x1="55.2" y1="-9.7" x2="58.2" y2="-10.2"/>
+              <line x1="56" y1="0" x2="62" y2="0"/>
+              <line x1="55.2" y1="9.7" x2="58.2" y2="10.2"/>
+              <line x1="52.7" y1="19.1" x2="55.7" y2="20.2"/>
+              <line x1="48.5" y1="28" x2="53.7" y2="31"/>
+              <line x1="43" y1="36" x2="45.4" y2="38.1"/>
+              <line x1="36" y1="43" x2="38.1" y2="45.4"/>
+              <line x1="28" y1="48.5" x2="31" y2="53.7"/>
+              <line x1="19.1" y1="52.7" x2="20.2" y2="55.7"/>
+              <line x1="9.7" y1="55.2" x2="10.2" y2="58.2"/>
+              <line x1="0" y1="56" x2="0" y2="62"/>
+              <line x1="-9.7" y1="55.2" x2="-10.2" y2="58.2"/>
+              <line x1="-19.1" y1="52.7" x2="-20.2" y2="55.7"/>
+              <line x1="-28" y1="48.5" x2="-31" y2="53.7"/>
+              <line x1="-36" y1="43" x2="-38.1" y2="45.4"/>
+              <line x1="-43" y1="36" x2="-45.4" y2="38.1"/>
+              <line x1="-48.5" y1="28" x2="-53.7" y2="31"/>
+              <line x1="-52.7" y1="19.1" x2="-55.7" y2="20.2"/>
+              <line x1="-55.2" y1="9.7" x2="-58.2" y2="10.2"/>
+              <line x1="-56" y1="0" x2="-62" y2="0"/>
+              <line x1="-55.2" y1="-9.7" x2="-58.2" y2="-10.2"/>
+              <line x1="-52.7" y1="-19.1" x2="-55.7" y2="-20.2"/>
+              <line x1="-48.5" y1="-28" x2="-53.7" y2="-31"/>
+              <line x1="-43" y1="-36" x2="-45.4" y2="-38.1"/>
+              <line x1="-36" y1="-43" x2="-38.1" y2="-45.4"/>
+              <line x1="-28" y1="-48.5" x2="-31" y2="-53.7"/>
+              <line x1="-19.1" y1="-52.7" x2="-20.2" y2="-55.7"/>
+              <line x1="-9.7" y1="-55.2" x2="-10.2" y2="-58.2"/>
+            </g>
+          </g>
+          <!-- inner hex frame -->
+          <polygon points="0,-44 38,-22 38,22 0,44 -38,22 -38,-22" fill="rgba(255,255,255,0.7)" stroke="#0ea5e9" stroke-opacity="0.7" stroke-width="1"/>
+          <!-- hard-hat brim motif -->
+          <path d="M -26 8 Q -26 -14 0 -16 Q 26 -14 26 8" fill="none" stroke="#0ea5e9" stroke-opacity="0.35" stroke-width="1.2"/>
+          <!-- 筑 glyph -->
+          <text x="0" y="14" text-anchor="middle" fill="#0ea5e9" font-size="42" font-weight="600"
+                font-family='"Noto Serif SC","Source Han Serif SC", serif'
+                style="filter:drop-shadow(0 0 6px #0ea5e9)">筑</text>
+          <!-- scan sweep arc -->
+          <g class="scan-sweep">
+            <path d="M 0 0 L 0 -78 A 78 78 0 0 1 67.5 -39 Z" fill="#0ea5e9" opacity="0.07"/>
+          </g>
+          <!-- corner reticles -->
+          <g transform="translate(-92,-92)"><line x1="0" y1="0" x2="10"  y2="0" stroke="#0ea5e9" stroke-opacity="0.6" stroke-width="1"/><line x1="0" y1="0" x2="0" y2="10"  stroke="#0ea5e9" stroke-opacity="0.6" stroke-width="1"/></g>
+          <g transform="translate(92,-92)"><line  x1="0" y1="0" x2="-10" y2="0" stroke="#0ea5e9" stroke-opacity="0.6" stroke-width="1"/><line x1="0" y1="0" x2="0" y2="10"  stroke="#0ea5e9" stroke-opacity="0.6" stroke-width="1"/></g>
+          <g transform="translate(-92,92)"><line  x1="0" y1="0" x2="10"  y2="0" stroke="#0ea5e9" stroke-opacity="0.6" stroke-width="1"/><line x1="0" y1="0" x2="0" y2="-10" stroke="#0ea5e9" stroke-opacity="0.6" stroke-width="1"/></g>
+          <g transform="translate(92,92)"><line   x1="0" y1="0" x2="-10" y2="0" stroke="#0ea5e9" stroke-opacity="0.6" stroke-width="1"/><line x1="0" y1="0" x2="0" y2="-10" stroke="#0ea5e9" stroke-opacity="0.6" stroke-width="1"/></g>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <div class="brand-eyebrow">ACCIDENT PREVENTION AGENT</div>
+        <h1 class="brand-title">筑保事故预防 <span class="agent-en">Agent</span></h1>
+      </div>
+    </div>
+
+    <form class="login" id="login-form"
+          data-invalid-pw="{{LOGIN_INVALID_PW}}"
+          data-conn-failed="{{LOGIN_CONN_FAILED}}"
+          autocomplete="on">
+      <span class="login-corner tl"></span>
+      <span class="login-corner tr"></span>
+      <span class="login-corner bl"></span>
+      <span class="login-corner br"></span>
+
+      <div class="field">
+        <label class="field-lbl" for="username">账号</label>
+        <div class="input-shell">
+          <span class="ic">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <circle cx="8" cy="5.5" r="2.6" stroke="currentColor" stroke-width="1.2"/>
+              <path d="M2.5 13.5c.8-2.6 3-3.9 5.5-3.9s4.7 1.3 5.5 3.9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <input type="text" id="username" autocomplete="username"
+                 autocapitalize="none" autocorrect="off" spellcheck="false"
+                 placeholder="请输入账号" autofocus>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="field-lbl" for="pw">登录密码</label>
+        <div class="input-shell">
+          <span class="ic">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect x="3" y="7" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+              <path d="M5 7V5a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.2"/>
+              <circle cx="8" cy="10.5" r="1" fill="currentColor"/>
+            </svg>
+          </span>
+          <input type="password" id="pw" autocomplete="current-password" placeholder="请输入密码">
+          <button type="button" id="toggle-pw" class="toggle-vis" aria-label="显示密码" aria-pressed="false">
+            <svg id="icon-eye" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5S1 8 1 8z" stroke="currentColor" stroke-width="1.2"/>
+              <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.2"/>
+            </svg>
+            <svg id="icon-eye-off" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" style="display:none">
+              <path d="M2 2l12 12M6.5 6.5A2 2 0 008 10c.6 0 1.1-.2 1.5-.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+              <path d="M3 8s2.5-5 7-5c1.4 0 2.6.5 3.7 1.2M14.5 11A12 12 0 0015 8s-2.5-5-7-5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <button class="btn-primary" type="submit">
+        <span>登 录</span>
+        <span class="arrow">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </span>
+      </button>
+
+      <div class="err" id="err"></div>
+    </form>
+
+  </div>
+
+  <footer class="mini-footer">
+    <span>© 2026 筑保科技</span>
+    <span class="sep">·</span>
+    <span>等保三级</span>
+    <span class="sep">·</span>
+    <span>v{{WEBUI_VERSION}}</span>
+  </footer>
+
 </div>
+
+<script>
+// Password show/hide toggle — vanilla, runs before login.js attaches the form.
+(function(){
+  var btn = document.getElementById('toggle-pw');
+  var pw  = document.getElementById('pw');
+  var ie  = document.getElementById('icon-eye');
+  var io  = document.getElementById('icon-eye-off');
+  if (!btn || !pw || !ie || !io) return;
+  btn.addEventListener('click', function(){
+    var hidden = pw.type === 'password';
+    pw.type = hidden ? 'text' : 'password';
+    btn.setAttribute('aria-pressed', hidden ? 'true' : 'false');
+    btn.setAttribute('aria-label', hidden ? '隐藏密码' : '显示密码');
+    ie.style.display = hidden ? 'none' : 'block';
+    io.style.display = hidden ? 'block' : 'none';
+  });
+})();
+</script>
 <!-- Keep login.js relative so subpath mounts load it under the current scope. -->
 <script src="static/login.js?v={{WEBUI_VERSION}}"></script>
 </body></html>"""
@@ -3158,42 +3634,81 @@ def handle_get(handler, parsed) -> bool:
         except Exception as exc:
             return _serve_shell_unavailable(handler, exc)
 
+    # ── Multi-user: init-admin first-run wizard + admin endpoints (GET) ──
+    if parsed.path == "/init-admin":
+        from api.users import has_any_user
+        if has_any_user():
+            handler.send_response(302)
+            handler.send_header('Location', '/login')
+            handler.end_headers()
+            return True
+        try:
+            static_root = Path(__file__).parent.parent / "static"
+            page = (static_root / "init-admin.html").read_text(encoding='utf-8')
+            return t(handler, page, content_type="text/html; charset=utf-8")
+        except FileNotFoundError:
+            return bad(handler, "init-admin page missing", status=500)
+
+    if parsed.path == "/api/init-admin/status":
+        from api.admin_users import handle_init_admin_status
+        return handle_init_admin_status(handler, parsed)
+
+    if parsed.path == "/api/me":
+        from api.auth import current_user
+        u = current_user(handler)
+        if not u:
+            return j(handler, {'user': None})
+        return j(handler, {'user': {k: v for k, v in u.items() if k != 'password_hash'}})
+
+    if parsed.path == "/api/admin/users" or _ADMIN_USER_ID_PATH_RE.match(parsed.path or ""):
+        if not _admin_or_403(handler):
+            return True
+        from api.admin_users import handle_admin_users_get
+        return handle_admin_users_get(handler, parsed)
+
+    if parsed.path == "/api/admin/usage" or _ADMIN_USAGE_ID_PATH_RE.match(parsed.path or ""):
+        if not _admin_or_403(handler):
+            return True
+        from api.admin_users import handle_admin_usage
+        return handle_admin_usage(handler, parsed)
+
     if parsed.path == "/login":
+        # The 筑保-design template is hardcoded zh-CN and uses only three
+        # template variables: WEBUI_VERSION (cache-bust + footer) and the
+        # two error strings login.js reads via data-* attrs. The old BOT_NAME
+        # / LOGIN_TITLE / LANG placeholders were stripped when the template
+        # was redesigned; the .replace() calls for them were no-ops. We still
+        # honour the per-locale strings for the two error messages so a
+        # non-zh deployment can surface localized error text.
         _settings = load_settings()
-        _bn = _html.escape(_settings.get("bot_name") or "Hermes")
         _lang = _settings.get("language", "en")
-        _login_strings = _LOGIN_LOCALE[
-            _resolve_login_locale_key(_lang)
-        ]
+        _login_strings = _LOGIN_LOCALE[_resolve_login_locale_key(_lang)]
         from urllib.parse import quote
         from api.updates import WEBUI_VERSION
         version_token = quote(WEBUI_VERSION, safe="")
         _page = (
-            _LOGIN_PAGE_HTML.replace("{{BOT_NAME}}", _bn)
-            .replace("{{BOT_NAME_INITIAL}}", _bn[0].upper())
+            _LOGIN_PAGE_HTML
             .replace("{{WEBUI_VERSION}}", version_token)
-            .replace("{{LANG}}", _html.escape(_login_strings["lang"]))
-            .replace("{{LOGIN_TITLE}}", _html.escape(_login_strings["title"]))
-            .replace("{{LOGIN_SUBTITLE}}", _html.escape(_login_strings["subtitle"]))
-            .replace(
-                "{{LOGIN_PLACEHOLDER}}", _html.escape(_login_strings["placeholder"])
-            )
-            .replace("{{LOGIN_BTN}}", _html.escape(_login_strings["btn"]))
             .replace("{{LOGIN_INVALID_PW}}", _html.escape(_login_strings["invalid_pw"]))
-            .replace(
-                "{{LOGIN_CONN_FAILED}}", _html.escape(_login_strings["conn_failed"])
-            )
+            .replace("{{LOGIN_CONN_FAILED}}", _html.escape(_login_strings["conn_failed"]))
         )
         return t(handler, _page, content_type="text/html; charset=utf-8")
 
     if parsed.path == "/api/auth/status":
-        from api.auth import is_auth_enabled, parse_cookie, verify_session
+        from api.auth import current_user
+        from api.users import has_any_user
 
-        logged_in = False
-        if is_auth_enabled():
-            cv = parse_cookie(handler)
-            logged_in = bool(cv and verify_session(cv))
-        return j(handler, {"auth_enabled": is_auth_enabled(), "logged_in": logged_in})
+        user = current_user(handler)
+        payload = {
+            "auth_enabled": True,
+            "logged_in": user is not None,
+            "needs_init": not has_any_user(),
+        }
+        if user:
+            payload["user"] = {
+                k: v for k, v in user.items() if k != 'password_hash'
+            }
+        return j(handler, payload)
 
     if parsed.path in ("/manifest.json", "/manifest.webmanifest"):
         return _serve_manifest(handler)
@@ -4333,15 +4848,21 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e))
 
     if parsed.path == "/api/default-model":
+        if not _admin_or_403(handler):
+            return True
         try:
-            return j(handler, set_hermes_default_model(body.get("model")))
+            result = set_hermes_default_model(body.get("model"))
         except ValueError as e:
             return bad(handler, str(e))
         except RuntimeError as e:
             return bad(handler, str(e), 500)
+        _mirror_global_config_after_admin_write()
+        return j(handler, result)
 
     # ── Providers (POST) ──
     if parsed.path == "/api/providers":
+        if not _admin_or_403(handler):
+            return True
         provider_id = (body.get("provider") or "").strip().lower()
         api_key = body.get("api_key")
         if not provider_id:
@@ -4351,19 +4872,25 @@ def handle_post(handler, parsed) -> bool:
         result = set_provider_key(provider_id, api_key)
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
+        _mirror_global_config_after_admin_write()
         return j(handler, result)
 
     if parsed.path == "/api/providers/delete":
+        if not _admin_or_403(handler):
+            return True
         provider_id = (body.get("provider") or "").strip().lower()
         if not provider_id:
             return bad(handler, "provider is required")
         result = remove_provider_key(provider_id)
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
+        _mirror_global_config_after_admin_write()
         return j(handler, result)
 
     # ── Custom relays / 中转端点 (POST) ──
     if parsed.path == "/api/custom-relays":
+        if not _admin_or_403(handler):
+            return True
         result = upsert_custom_relay(
             body.get("name"),
             body.get("base_url"),
@@ -4373,15 +4900,21 @@ def handle_post(handler, parsed) -> bool:
         )
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
+        _mirror_global_config_after_admin_write()
         return j(handler, result)
 
     if parsed.path == "/api/custom-relays/delete":
+        if not _admin_or_403(handler):
+            return True
         result = delete_custom_relay(body.get("name"))
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
+        _mirror_global_config_after_admin_write()
         return j(handler, result)
 
     if parsed.path == "/api/custom-relays/probe":
+        if not _admin_or_403(handler):
+            return True
         result = probe_custom_relay(body.get("base_url"), body.get("api_key"))
         return j(handler, result)
 
@@ -4393,18 +4926,25 @@ def handle_post(handler, parsed) -> bool:
         #   {"display": "show"|"hide"|"on"|"off"}   → display.show_reasoning
         #   {"effort":  "none"|"minimal"|"low"|"medium"|"high"|"xhigh"}
         #                                            → agent.reasoning_effort
+        if not _admin_or_403(handler):
+            return True
         try:
             display = body.get("display")
             effort = body.get("effort")
             if display is not None:
                 flag = str(display).strip().lower()
                 if flag in ("show", "on", "true", "1"):
-                    return j(handler, set_reasoning_display(True))
-                if flag in ("hide", "off", "false", "0"):
-                    return j(handler, set_reasoning_display(False))
-                return bad(handler, f"display must be show|hide|on|off (got '{display}')")
+                    result = set_reasoning_display(True)
+                elif flag in ("hide", "off", "false", "0"):
+                    result = set_reasoning_display(False)
+                else:
+                    return bad(handler, f"display must be show|hide|on|off (got '{display}')")
+                _mirror_global_config_after_admin_write()
+                return j(handler, result)
             if effort is not None:
-                return j(handler, set_reasoning_effort(effort))
+                result = set_reasoning_effort(effort)
+                _mirror_global_config_after_admin_write()
+                return j(handler, result)
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
         except ValueError as e:
             return bad(handler, str(e))
@@ -4635,6 +5175,29 @@ def handle_post(handler, parsed) -> bool:
         cli_meta_for_delete = _lookup_cli_session_metadata(sid)
         if cli_meta_for_delete.get("read_only"):
             return bad(handler, "Read-only imported sessions cannot be deleted from WebUI", 400)
+        # SECURITY: multi-user ownership check. Without this, any authenticated
+        # user could POST another user's session_id and (a) decrement that
+        # user's concurrency quota counter, (b) unlink their session file,
+        # (c) tear down their terminal. Admin keeps the cross-user delete
+        # path for ops cleanup. NOTE: drop_active_session has been moved to
+        # AFTER the unlink succeeds so a failed delete doesn't drift the
+        # quota counter (#review-fix bug_034).
+        try:
+            from api.auth import current_user as _cur_user
+            _me = _cur_user(handler)
+            if _me is not None:
+                # Resolve the session's owning profile. Metadata-only load
+                # avoids the cost of a full session re-read.
+                _sess_meta = None
+                try:
+                    _sess_meta = get_session(sid, metadata_only=True)
+                except (KeyError, TypeError):
+                    _sess_meta = None
+                _owner_profile = (getattr(_sess_meta, 'profile', None) if _sess_meta else None) or 'default'
+                if _owner_profile != _me.get('profile_name') and _me.get('role') != 'admin':
+                    return bad(handler, "Cannot delete another user's session", 403)
+        except Exception:
+            logger.debug("ownership check on /api/session/delete failed (non-fatal)", exc_info=True)
         is_messaging_session = _is_messaging_session_id(sid)
         worktree_retained = _worktree_retained_payload_for_session_id(sid)
         # Delete from WebUI session store
@@ -4657,6 +5220,15 @@ def handle_post(handler, parsed) -> bool:
             p.with_suffix('.json.bak').unlink(missing_ok=True)
         except Exception:
             logger.debug("Failed to unlink session file %s", p)
+        # Multi-user: NOW free the active-session row that counted against
+        # this user's concurrency quota. Moved here from before the unlink
+        # so a path-traversal early-return at line ~5210 doesn't drift the
+        # counter (#review-fix bug_034).
+        try:
+            from api import users as _users_mod
+            _users_mod.drop_active_session(sid)
+        except Exception:
+            logger.debug("drop_active_session failed for %s", sid, exc_info=True)
         # Prune the per-session agent lock so deleted sessions don't leak
         # Lock entries in SESSION_AGENT_LOCKS forever.
         with SESSION_AGENT_LOCKS_LOCK:
@@ -4892,40 +5464,52 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/terminal/close":
         return _handle_terminal_close(handler, body)
 
-    # ── Cron API (POST) ──
+    # ── Cron API (POST) ── Multi-user: admin-only (regular users can't schedule).
     # See GET-side comment above: wrap in cron_profile_context so writes go
     # to the TLS-active profile's jobs.json instead of the process default.
     if parsed.path == "/api/crons/create":
+        if not _admin_or_403(handler):
+            return True
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
             return _handle_cron_create(handler, body)
 
     if parsed.path == "/api/crons/update":
+        if not _admin_or_403(handler):
+            return True
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
             return _handle_cron_update(handler, body)
 
     if parsed.path == "/api/crons/delete":
+        if not _admin_or_403(handler):
+            return True
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
             return _handle_cron_delete(handler, body)
 
     if parsed.path == "/api/crons/run":
+        if not _admin_or_403(handler):
+            return True
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
             return _handle_cron_run(handler, body)
 
     if parsed.path == "/api/crons/pause":
+        if not _admin_or_403(handler):
+            return True
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
             return _handle_cron_pause(handler, body)
 
     if parsed.path == "/api/crons/resume":
+        if not _admin_or_403(handler):
+            return True
         from api.profiles import cron_profile_context
 
         with cron_profile_context():
@@ -5001,33 +5585,38 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/memory/write":
         return _handle_memory_write(handler, body)
 
+    # ── Multi-user: init-admin first-run + admin user CRUD (POST) ──
+    if parsed.path == "/api/init-admin/create":
+        from api.admin_users import handle_init_admin_create
+        return handle_init_admin_create(handler, parsed, body)
+
+    if parsed.path == "/api/admin/users":
+        if not _admin_or_403(handler):
+            return True
+        from api.admin_users import handle_admin_users_post
+        return handle_admin_users_post(handler, parsed, body)
+
     # ── Profile API (POST) ──
     if parsed.path == "/api/profile/switch":
-        name = body.get("name", "").strip()
-        if not name:
-            return bad(handler, "name is required")
-        try:
-            from api.profiles import switch_profile, _validate_profile_name
-            from api.helpers import build_profile_cookie
-            if name != 'default':
-                _validate_profile_name(name)
-            # process_wide=False: don't mutate the process-global _active_profile.
-            # Per-client profile is managed via cookie + thread-local (#798).
-            result = switch_profile(name, process_wide=False)
-            # Invalidate the models cache so the very next /api/models request
-            # rebuilds from the new profile's config.yaml rather than returning
-            # the old profile's cached model list (#1200 — profile-switch model bug).
-            from api.config import invalidate_models_cache
-            invalidate_models_cache()
-            return j(handler, result, extra_headers={
-                'Set-Cookie': build_profile_cookie(name),
-            })
-        except (ValueError, FileNotFoundError) as e:
-            return bad(handler, _sanitize_error(e), 404)
-        except RuntimeError as e:
-            return bad(handler, str(e), 409)
+        # Multi-user: profile switching is disabled. Each user is pinned to
+        # their assigned profile by the auth layer. Impersonation was scoped
+        # out (it requires an actor_user_id-aware audit trail that isn't
+        # threaded through the streaming hook yet). Remove the impersonation
+        # path entirely until it can be implemented end-to-end; otherwise
+        # admin actions would attribute turns to the target user with no
+        # record of the actor.
+        return bad(
+            handler,
+            "profile switching is disabled in multi-user mode "
+            "(impersonation TBD: needs end-to-end actor_user_id audit trail)",
+            status=403,
+        )
 
     if parsed.path == "/api/profile/create":
+        from api.auth import current_user as _cur_user
+        _u = _cur_user(handler)
+        if not _u or _u.get('role') != 'admin':
+            return bad(handler, "profile create is admin-only; create a user instead", status=403)
         name = body.get("name", "").strip()
         if not name:
             return bad(handler, "name is required")
@@ -5066,6 +5655,10 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e))
 
     if parsed.path == "/api/profile/delete":
+        from api.auth import current_user as _cur_user
+        _u = _cur_user(handler)
+        if not _u or _u.get('role') != 'admin':
+            return bad(handler, "profile delete is admin-only", status=403)
         name = body.get("name", "").strip()
         if not name:
             return bad(handler, "name is required")
@@ -5082,6 +5675,13 @@ def handle_post(handler, parsed) -> bool:
 
     # ── Settings (POST) ──
     if parsed.path == "/api/settings":
+        # Multi-user: settings.json is a process-global file. Any write to it
+        # affects every user, so the whole endpoint is admin-only. (Per-user
+        # personal preferences like theme/language live in localStorage on
+        # the client; if a server-side per-user prefs store is needed, add a
+        # new endpoint scoped to the request's profile.)
+        if not _admin_or_403(handler):
+            return True
         from api.auth import (
             create_session,
             is_auth_enabled,
@@ -5149,6 +5749,8 @@ def handle_post(handler, parsed) -> bool:
         return True
 
     if parsed.path == "/api/onboarding/oauth/start":
+        if not _admin_or_403(handler):
+            return True
         from api.auth import is_auth_enabled
         import os as _os
         if not is_auth_enabled() and not _os.getenv("HERMES_WEBUI_ONBOARDING_OPEN"):
@@ -5171,12 +5773,16 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e), 500)
 
     if parsed.path == "/api/onboarding/oauth/cancel":
+        if not _admin_or_403(handler):
+            return True
         try:
             return j(handler, cancel_onboarding_oauth_flow(body), extra_headers={"Cache-Control": "no-store"})
         except ValueError as e:
             return bad(handler, str(e))
 
     if parsed.path == "/api/onboarding/setup":
+        if not _admin_or_403(handler):
+            return True
         # Writing API keys to disk - restrict to local/private networks unless auth is active.
         # In Docker, requests arrive from the bridge network (172.x.x.x), not 127.0.0.1,
         # even when the user accesses via localhost:8787 on the host.
@@ -5208,9 +5814,13 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e), 500)
 
     if parsed.path == "/api/onboarding/complete":
+        if not _admin_or_403(handler):
+            return True
         return j(handler, complete_onboarding())
 
     if parsed.path == "/api/onboarding/probe":
+        if not _admin_or_403(handler):
+            return True
         # Probe a self-hosted provider endpoint (#1499).  Validates the
         # configured base URL is reachable + parses /models, returns the
         # model catalog so the wizard can populate its dropdown.
@@ -5567,15 +6177,28 @@ def handle_post(handler, parsed) -> bool:
     # ── Auth endpoints (POST) ──
     if parsed.path == "/api/auth/login":
         from api.auth import (
-            verify_password,
-            create_session,
+            create_session_for_user,
             set_auth_cookie,
-            is_auth_enabled,
+            _check_login_rate,
+            _record_login_attempt,
         )
-        from api.auth import _check_login_rate, _record_login_attempt
+        from api import users as _users_mod
 
-        if not is_auth_enabled():
-            return j(handler, {"ok": True, "message": "Auth not enabled"})
+        # Test escape hatch: when HERMES_WEBUI_TEST_NO_AUTH=1 (set by
+        # tests/conftest.py for the legacy live-server fleet), report
+        # "auth not enabled" so existing tests that POST to /api/auth/login
+        # without setting up an admin keep working.
+        if os.environ.get('HERMES_WEBUI_TEST_NO_AUTH', '').strip() in ('1', 'true', 'yes'):
+            return j(handler, {"ok": True, "message": "Auth not enabled (test mode)"})
+
+        # Init-admin gate: if no users yet, point caller at the wizard.
+        if not _users_mod.has_any_user():
+            return j(
+                handler,
+                {"error": "setup required", "next": "/init-admin"},
+                status=409,
+            )
+
         client_ip = handler.client_address[0]
         if not _check_login_rate(client_ip):
             return j(
@@ -5583,18 +6206,27 @@ def handle_post(handler, parsed) -> bool:
                 {"error": "Too many attempts. Try again in a minute."},
                 status=429,
             )
-        password = body.get("password", "")
-        if not verify_password(password):
+        username = str(body.get("username", "")).strip().lower()
+        password = str(body.get("password", ""))
+        if not username or not password:
             _record_login_attempt(client_ip)
-            return bad(handler, "Invalid password", 401)
-        cookie_val = create_session()
+            return bad(handler, "username and password are required", 400)
+        user = _users_mod.verify(username, password)
+        if not user:
+            _record_login_attempt(client_ip)
+            return bad(handler, "Invalid username or password", 401)
+        _users_mod.write_audit(user['id'], 'login')
+        cookie_val = create_session_for_user(user['id'])
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Cache-Control", "no-store")
         _security_headers(handler)
         set_auth_cookie(handler, cookie_val)
         handler.end_headers()
-        handler.wfile.write(json.dumps({"ok": True}).encode())
+        handler.wfile.write(json.dumps({
+            "ok": True,
+            "user": {k: v for k, v in user.items() if k != 'password_hash'},
+        }).encode())
         return True
 
     if parsed.path == "/api/auth/logout":
@@ -5637,6 +6269,12 @@ def handle_patch(handler, parsed) -> bool:
     if not _check_csrf(handler):
         return j(handler, {"error": "Cross-origin request rejected"}, status=403)
     body = read_body(handler)
+    # Multi-user: admin user updates
+    if _ADMIN_USER_ID_PATH_RE.match(parsed.path or ""):
+        if not _admin_or_403(handler):
+            return True
+        from api.admin_users import handle_admin_users_patch
+        return handle_admin_users_patch(handler, parsed, body)
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_patch
 
@@ -5652,6 +6290,18 @@ def handle_delete(handler, parsed) -> bool:
     if not _check_csrf(handler):
         return j(handler, {"error": "Cross-origin request rejected"}, status=403)
     body = read_body(handler)
+    # Multi-user: admin user delete (archives profile dir by default).
+    # SECURITY: gate at dispatch site BEFORE delegating. The previous shape
+    # called invalidate_sessions_for_user here unconditionally, which let
+    # any authenticated user DoS any other user (incl. admin) by issuing
+    # `DELETE /api/admin/users/<id>` — CSRF passes for same-origin XHRs.
+    # invalidate is now done inside handle_admin_users_delete AFTER the
+    # delete succeeds (api/admin_users.py).
+    if _ADMIN_USER_ID_PATH_RE.match(parsed.path or ""):
+        if not _admin_or_403(handler):
+            return True
+        from api.admin_users import handle_admin_users_delete
+        return handle_admin_users_delete(handler, parsed, body)
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_delete
 
@@ -9373,6 +10023,10 @@ def _handle_handoff_summary(handler, body):
 
 
 def _handle_skill_save(handler, body):
+    """Save a skill. Multi-user: ``body['scope']`` may be ``"global"`` (admin
+    only — writes to ``~/.hermes/global/skills/``) or ``"user"`` (the default;
+    writes to the request's profile skills dir).
+    """
     try:
         require(body, "name", "content")
     except ValueError as e:
@@ -9383,13 +10037,23 @@ def _handle_skill_save(handler, body):
     category = body.get("category", "").strip()
     if category and ("/" in category or ".." in category):
         return bad(handler, "Invalid category")
-    skills_dir = _active_skills_dir()
+
+    scope = str(body.get("scope", "user")).strip().lower() or "user"
+    if scope not in ("user", "global"):
+        return bad(handler, "scope must be 'user' or 'global'")
+    if scope == "global":
+        if not _admin_or_403(handler):
+            return True
+        from api.global_skills import ensure_global_skills_dir
+        skills_dir = ensure_global_skills_dir()
+    else:
+        skills_dir = _active_skills_dir()
 
     if category:
         skill_dir = skills_dir / category / skill_name
     else:
         skill_dir = skills_dir / skill_name
-    # Validate resolved path stays within the active profile skills dir.
+    # Validate resolved path stays within the chosen skills root.
     try:
         skill_dir.resolve().relative_to(skills_dir.resolve())
     except ValueError:
@@ -9397,10 +10061,13 @@ def _handle_skill_save(handler, body):
     skill_dir.mkdir(parents=True, exist_ok=True)
     skill_file = skill_dir / "SKILL.md"
     skill_file.write_text(body["content"], encoding="utf-8")
-    return j(handler, {"ok": True, "name": skill_name, "path": str(skill_file)})
+    return j(handler, {
+        "ok": True, "name": skill_name, "path": str(skill_file), "scope": scope,
+    })
 
 
 def _handle_skill_delete(handler, body):
+    """Delete a skill. Same scope semantics as _handle_skill_save."""
     try:
         require(body, "name")
     except ValueError as e:
@@ -9410,13 +10077,26 @@ def _handle_skill_delete(handler, body):
     skill_name = str(body["name"]).strip().lower().replace(" ", "-")
     if not skill_name or "/" in skill_name or ".." in skill_name:
         return bad(handler, "Invalid skill name")
-    skills_dir = _active_skills_dir()
+
+    scope = str(body.get("scope", "user")).strip().lower() or "user"
+    if scope not in ("user", "global"):
+        return bad(handler, "scope must be 'user' or 'global'")
+    if scope == "global":
+        if not _admin_or_403(handler):
+            return True
+        from api.global_skills import global_skills_dir as _global_skills_dir
+        skills_dir = _global_skills_dir()
+    else:
+        skills_dir = _active_skills_dir()
+
+    if not skills_dir.exists():
+        return bad(handler, "Skill not found", 404)
     matches = [p for p in skills_dir.rglob("SKILL.md") if p.parent.name == skill_name]
     if not matches:
         return bad(handler, "Skill not found", 404)
     skill_dir = matches[0].parent
     shutil.rmtree(str(skill_dir))
-    return j(handler, {"ok": True, "name": body["name"]})
+    return j(handler, {"ok": True, "name": body["name"], "scope": scope})
 
 
 def _handle_memory_write(handler, body):

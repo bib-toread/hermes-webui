@@ -4939,16 +4939,17 @@ let _settingsPreferencesAutosaveTimer = null;
 let _settingsPreferencesAutosaveRetryPayload = null;
 
 function switchSettingsSection(name){
-  const section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system')?name:'conversation';
+  const valid=['appearance','preferences','providers','plugins','system','admin'];
+  const section=valid.includes(name)?name:'conversation';
   _settingsSection=section;
   _currentSettingsSection=section;
-  const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',plugins:'Plugins',system:'System'};
+  const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',plugins:'Plugins',system:'System',admin:'Admin'};
   // Sidebar menu items
   document.querySelectorAll('#settingsMenu .side-menu-item').forEach(it=>{
     it.classList.toggle('active', it.dataset.settingsSection===section);
   });
   // Panes in main
-  ['conversation','appearance','preferences','providers','plugins','system'].forEach(key=>{
+  Object.keys(map).forEach(key=>{
     const pane=$('settingsPane'+map[key]);
     if(pane) pane.classList.toggle('active', key===section);
   });
@@ -4958,6 +4959,7 @@ function switchSettingsSection(name){
   // Lazy-load integration panels when their tabs are opened
   if(section==='providers') loadProvidersPanel();
   if(section==='plugins') loadPluginsPanel();
+  if(section==='admin') loadAdminPanel(false);
 }
 
 function _syncHermesPanelSessionActions(){
@@ -7093,3 +7095,449 @@ async function _restoreCheckpoint(workspace,checkpoint,message){
     showToast(t('checkpoint_restore')+': '+e.message,'error');
   }
 }
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Multi-user admin panel
+ *
+ * Surfaces /api/admin/users, /api/admin/usage/<id>, /api/admin/users (POST),
+ * /api/admin/users/<id> (PATCH/DELETE), /api/me. Tabs and modals defined in
+ * static/index.html. Styling in static/style.css under "Multi-user admin
+ * panel". Hidden from non-admins via adminApplyRoleVisibility().
+ * ───────────────────────────────────────────────────────────────────── */
+
+let _adminUsersCache = null;
+let _adminCurrentUser = null;  // {id, username, role, ...} populated from /api/me
+
+function _adminEsc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+function _adminFmtTs(ts){
+  if(!ts) return '—';
+  try{
+    const d = new Date(ts * 1000);
+    const pad = n => String(n).padStart(2,'0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }catch(_){ return String(ts); }
+}
+
+function _adminFmtRelative(ts){
+  if(!ts) return '从未';
+  const now = Math.floor(Date.now()/1000);
+  const d = now - ts;
+  if(d < 60) return d + '秒前';
+  if(d < 3600) return Math.floor(d/60) + '分钟前';
+  if(d < 86400) return Math.floor(d/3600) + '小时前';
+  return Math.floor(d/86400) + '天前';
+}
+
+async function loadAdminPanel(forceRefresh){
+  const status = document.getElementById('adminUsersStatus');
+  const wrap = document.getElementById('adminUsersTableWrap');
+  if(!status || !wrap) return;
+  if(!forceRefresh && _adminUsersCache){
+    adminRenderUsersTable(_adminUsersCache);
+    return;
+  }
+  status.textContent = '加载中…';
+  wrap.innerHTML = '';
+  try{
+    const data = await api('/api/admin/users');
+    _adminUsersCache = data && data.users || [];
+    status.style.display = 'none';
+    adminRenderUsersTable(_adminUsersCache);
+    adminRenderOrphanProfiles((data && data.orphan_profiles) || []);
+  }catch(e){
+    status.style.display = '';
+    status.textContent = '加载失败：' + (e && e.message || e);
+    status.style.color = '#ff5b6f';
+  }
+}
+
+function adminRenderOrphanProfiles(orphans){
+  // Tagged container appended after the users table. Re-rendered on every
+  // refresh so the list stays in sync with the user table.
+  const wrap = document.getElementById('adminUsersTableWrap');
+  if(!wrap) return;
+  // Remove any prior orphan block.
+  const prev = document.getElementById('adminOrphanWrap');
+  if(prev) prev.remove();
+  if(!orphans || !orphans.length) return;
+  const div = document.createElement('div');
+  div.id = 'adminOrphanWrap';
+  div.style.cssText = 'margin-top:18px;padding:14px 16px;border:1px solid rgba(232,160,48,0.35);border-radius:10px;background:rgba(232,160,48,0.06)';
+  const rows = orphans.map(o => `<li style="font-family:var(--mono,monospace);font-size:12px;color:var(--text);margin:3px 0">
+    <b>${_adminEsc(o.name)}</b> <span style="color:var(--muted)">— ${_adminEsc(o.path||'')}</span>
+  </li>`).join('');
+  div.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:11px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#e8a030">⚠ 孤儿 Profile</span>
+      <span style="font-size:11px;color:var(--muted)">这些 profile 目录在磁盘上但没有任何用户认领</span>
+    </div>
+    <ul style="margin:0;padding-left:18px;list-style:'·  '">${rows}</ul>
+    <div style="margin-top:10px;font-size:11.5px;color:var(--muted);line-height:1.5">
+      处理方式：① 编辑某个用户、把 profile 改为孤儿名 → 转交；② 或在 shell 里手动 archive：<br>
+      <code style="font-family:var(--mono,monospace);background:var(--code-bg);padding:1px 6px;border-radius:4px">mv ~/.hermes/profiles/&lt;name&gt; ~/.hermes/archive/</code>
+    </div>
+  `;
+  wrap.parentNode.insertBefore(div, wrap.nextSibling);
+}
+
+function adminRenderUsersTable(users){
+  const wrap = document.getElementById('adminUsersTableWrap');
+  if(!wrap) return;
+  if(!users || !users.length){
+    wrap.innerHTML = '<div style="padding:24px;text-align:center;color:var(--muted);font-size:13px">还没有用户。点击右上角「新建用户」开始。</div>';
+    return;
+  }
+  const meId = _adminCurrentUser && _adminCurrentUser.id;
+  const rows = users.map(u => {
+    const isMe = u.id === meId;
+    const roleBadge = u.role === 'admin'
+      ? '<span class="admin-badge role-admin">管理员</span>'
+      : '<span class="admin-badge role-user">用户</span>';
+    const statusBadge = u.disabled
+      ? '<span class="admin-badge status-disabled">已停用</span>'
+      : '<span class="admin-badge status-ok">正常</span>';
+    const q = u.quota || {};
+    const turns = (u.turns_used_today||0) + ' / ' + (q.max_turns_per_day||'∞');
+    const concur = (u.active_sessions||0) + ' / ' + (q.max_concurrent_sessions||'∞');
+    return `<tr data-uid="${u.id}">
+      <td>
+        <div class="admin-username">${_adminEsc(u.username)}${isMe?'<span class="me">YOU</span>':''}</div>
+        <div class="admin-profile-name">${_adminEsc(u.profile_name||'')}</div>
+      </td>
+      <td>${roleBadge} ${statusBadge}</td>
+      <td>
+        <div class="admin-quota-cell">
+          <span class="meter"><b>${_adminEsc(turns)}</b> 今日轮数</span>
+          <span class="meter"><b>${_adminEsc(concur)}</b> 并发 session</span>
+          <span class="meter">上限存储 <b>${q.max_storage_mb||0}</b> MB</span>
+        </div>
+      </td>
+      <td><span style="font-family:var(--mono,monospace);font-size:11.5px;color:var(--text-soft,var(--muted))">${_adminEsc(_adminFmtRelative(u.last_activity_ts||0))}</span></td>
+      <td>
+        <div class="admin-row-actions">
+          <button class="btn-row" onclick="adminOpenUsageDrawer(${u.id}, ${JSON.stringify(u.username).replace(/"/g,'&quot;')})">用量</button>
+          <button class="btn-row" onclick="adminOpenUserModal(${u.id})">编辑</button>
+          ${isMe ? '' : `<button class="btn-row danger" onclick="adminDeleteUser(${u.id}, ${JSON.stringify(u.username).replace(/"/g,'&quot;')})">删除</button>`}
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+  wrap.innerHTML = `<table class="admin-table">
+    <thead>
+      <tr>
+        <th>用户</th>
+        <th>角色/状态</th>
+        <th>配额 & 当前</th>
+        <th>最后活跃</th>
+        <th style="text-align:right">操作</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function adminOpenUserModal(userId){
+  const modal = document.getElementById('adminUserModal');
+  if(!modal) return;
+  const isEdit = userId != null;
+  const user = isEdit ? (_adminUsersCache||[]).find(u => u.id === userId) : null;
+  document.getElementById('adminUserModalTitle').textContent = isEdit ? '编辑用户' : '新建用户';
+  document.getElementById('adminUserModalId').value = isEdit ? String(userId) : '';
+  document.getElementById('adminUserModalError').classList.remove('show');
+  document.getElementById('adminUserModalSubmit').textContent = isEdit ? '保存修改' : '创建';
+
+  const unameEl = document.getElementById('adminUserModalUsername');
+  unameEl.value = user ? user.username : '';
+  unameEl.disabled = !!isEdit;
+
+  const pwEl = document.getElementById('adminUserModalPassword');
+  const pwHint = document.getElementById('adminUserModalPwHint');
+  const pwOpt = document.getElementById('adminUserModalPwOpt');
+  pwEl.value = '';
+  pwEl.required = !isEdit;
+  pwOpt.textContent = isEdit ? '（留空表示不修改）' : '';
+  pwHint.textContent = isEdit ? '只在需要重置密码时填写。至少 4 字符。' : '至少 4 字符。';
+
+  document.getElementById('adminUserModalRole').value = user ? user.role : 'user';
+  document.getElementById('adminUserModalDisabledRow').style.display = isEdit ? '' : 'none';
+  document.getElementById('adminUserModalDisabled').checked = user ? !!user.disabled : false;
+  document.getElementById('adminUserModalProfileRow').style.display = isEdit ? '' : 'none';
+  document.getElementById('adminUserModalProfile').value = user ? (user.profile_name || '') : '';
+
+  const q = (user && user.quota) || {};
+  document.getElementById('adminQuotaTurns').value = q.max_turns_per_day != null ? q.max_turns_per_day : 200;
+  document.getElementById('adminQuotaConcur').value = q.max_concurrent_sessions != null ? q.max_concurrent_sessions : 5;
+  document.getElementById('adminQuotaStorage').value = q.max_storage_mb != null ? q.max_storage_mb : 2048;
+
+  modal.hidden = false;
+  setTimeout(()=>{ (isEdit ? pwEl : unameEl).focus(); }, 30);
+}
+
+function adminCloseUserModal(){
+  const modal = document.getElementById('adminUserModal');
+  if(modal) modal.hidden = true;
+}
+
+async function adminSubmitUserModal(ev){
+  ev && ev.preventDefault && ev.preventDefault();
+  const errEl = document.getElementById('adminUserModalError');
+  const submitBtn = document.getElementById('adminUserModalSubmit');
+  errEl.classList.remove('show');
+
+  const idRaw = document.getElementById('adminUserModalId').value;
+  const isEdit = !!idRaw;
+  const username = document.getElementById('adminUserModalUsername').value.trim().toLowerCase();
+  const password = document.getElementById('adminUserModalPassword').value;
+  const role = document.getElementById('adminUserModalRole').value;
+  const disabled = document.getElementById('adminUserModalDisabled').checked;
+  const quotas = {
+    max_turns_per_day: parseInt(document.getElementById('adminQuotaTurns').value, 10) || 0,
+    max_concurrent_sessions: parseInt(document.getElementById('adminQuotaConcur').value, 10) || 0,
+    max_storage_mb: parseInt(document.getElementById('adminQuotaStorage').value, 10) || 0,
+  };
+
+  if(!isEdit){
+    if(!/^[a-z0-9][a-z0-9_\-]{2,31}$/.test(username)){
+      errEl.textContent = '用户名格式不对：3-32 字符、小写字母/数字/_/-，必须字母数字开头。';
+      errEl.classList.add('show'); return;
+    }
+    if(!password || password.length < 4){
+      errEl.textContent = '密码至少 4 字符。'; errEl.classList.add('show'); return;
+    }
+  }else{
+    if(password && password.length < 4){
+      errEl.textContent = '新密码至少 4 字符（或留空不修改）。'; errEl.classList.add('show'); return;
+    }
+  }
+
+  submitBtn.disabled = true;
+  const originalLabel = submitBtn.textContent;
+  submitBtn.textContent = '保存中…';
+  try{
+    if(isEdit){
+      const body = { role, disabled, quotas };
+      if(password) body.password = password;
+      // Profile reassignment (orphan transfer). Only send if changed.
+      const newProfile = (document.getElementById('adminUserModalProfile').value || '').trim();
+      const oldProfile = ((_adminUsersCache||[]).find(u => u.id == idRaw) || {}).profile_name || '';
+      if(newProfile && newProfile !== oldProfile){
+        if(!/^[a-z0-9][a-z0-9_\-]{0,63}$/.test(newProfile)){
+          errEl.textContent = 'Profile 名称格式不对（小写字母数字 _ -，字母数字开头）。';
+          errEl.classList.add('show');
+          submitBtn.disabled = false; submitBtn.textContent = originalLabel;
+          return;
+        }
+        body.profile_name = newProfile;
+      }
+      await api('/api/admin/users/' + encodeURIComponent(idRaw), {
+        method: 'PATCH', body: JSON.stringify(body),
+      });
+      showToast('已更新用户 ' + username);
+    }else{
+      await api('/api/admin/users', {
+        method: 'POST',
+        body: JSON.stringify({ username, password, role, quotas }),
+      });
+      showToast('已创建用户 ' + username);
+    }
+    adminCloseUserModal();
+    loadAdminPanel(true);
+  }catch(e){
+    errEl.textContent = '保存失败：' + (e && e.message || e);
+    errEl.classList.add('show');
+  }finally{
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalLabel;
+  }
+}
+
+async function adminDeleteUser(userId, username){
+  const archive = confirm(
+    `确认删除用户 "${username}"?\n\n` +
+    `点击「确定」= 归档（profile 移到 ~/.hermes/archive/），可恢复\n` +
+    `点击「取消」= 不删除`
+  );
+  if(!archive) return;
+  try{
+    await api('/api/admin/users/' + encodeURIComponent(userId) + '?archive=1', {
+      method: 'DELETE',
+    });
+    showToast('已删除用户 ' + username + '（profile 已归档）');
+    loadAdminPanel(true);
+  }catch(e){
+    showToast('删除失败：' + (e && e.message || e), 'error');
+  }
+}
+
+async function adminOpenUsageDrawer(userId, username){
+  const drawer = document.getElementById('adminUsageDrawer');
+  const titleEl = document.getElementById('adminUsageTitle');
+  const bodyEl = document.getElementById('adminUsageBody');
+  if(!drawer || !bodyEl) return;
+  titleEl.textContent = '用量详情 · ' + username;
+  bodyEl.innerHTML = '加载中…';
+  drawer.hidden = false;
+  try{
+    const data = await api('/api/admin/usage/' + encodeURIComponent(userId) + '?days=30');
+    adminRenderUsageDrawer(data);
+  }catch(e){
+    bodyEl.innerHTML = '<div style="color:#ff5b6f;font-size:12.5px">加载失败：' + _adminEsc(e && e.message || e) + '</div>';
+  }
+}
+
+function adminCloseUsageDrawer(){
+  const drawer = document.getElementById('adminUsageDrawer');
+  if(drawer) drawer.hidden = true;
+}
+
+function adminRenderUsageDrawer(data){
+  const bodyEl = document.getElementById('adminUsageBody');
+  if(!bodyEl) return;
+  const q = data.quota || {};
+  const u = data.user || {};
+  // Build 30-day bar chart from daily_usage (newest first → reverse so chart reads left=old → right=today)
+  const daily = (data.daily_usage || []).slice().reverse();
+  const max = Math.max(1, ...daily.map(d => d.turns_used || 0));
+  const bars = daily.map(d => {
+    const h = Math.round(((d.turns_used || 0) / max) * 100);
+    return `<div class="admin-usage-bar" style="height:${Math.max(2, h)}%"><div class="tip">${_adminEsc(d.day)} · ${d.turns_used||0} 轮</div></div>`;
+  }).join('');
+
+  const audit = (data.recent_audit || []).slice(0, 60).map(a => {
+    let meta = '';
+    if(a.meta){
+      try{
+        const m = typeof a.meta === 'string' ? JSON.parse(a.meta) : a.meta;
+        meta = Object.keys(m).map(k => `${k}=${JSON.stringify(m[k])}`).join('  ');
+      }catch(_){ meta = String(a.meta); }
+    }
+    return `<div class="admin-audit-row ${_adminEsc(a.event)}">
+      <span class="ts">${_adminEsc(_adminFmtTs(a.ts))}</span>
+      <span class="ev">${_adminEsc(a.event)}</span>
+      <span>${_adminEsc(meta)}</span>
+    </div>`;
+  }).join('') || '<div style="color:var(--muted);font-size:11.5px;padding:6px">无审计记录</div>';
+
+  bodyEl.innerHTML = `
+    <div class="admin-usage-summary">
+      <div class="admin-usage-stat">
+        <div class="lbl">今日轮数</div>
+        <div class="num">${data.turns_used_today||0}<span class="unit">/ ${q.max_turns_per_day||'∞'}</span></div>
+      </div>
+      <div class="admin-usage-stat">
+        <div class="lbl">活跃 session</div>
+        <div class="num">${data.active_sessions||0}<span class="unit">/ ${q.max_concurrent_sessions||'∞'}</span></div>
+      </div>
+      <div class="admin-usage-stat">
+        <div class="lbl">存储占用</div>
+        <div class="num">${data.storage_mb||0}<span class="unit">/ ${q.max_storage_mb||'∞'} MB</span></div>
+      </div>
+      <div class="admin-usage-stat">
+        <div class="lbl">最后活跃</div>
+        <div class="num" style="font-size:13px;line-height:1.5">${_adminEsc(_adminFmtRelative(data.last_activity_ts||0))}<br><span class="unit" style="margin-left:0">${_adminEsc(_adminFmtTs(data.last_activity_ts||0))}</span></div>
+      </div>
+    </div>
+
+    <div class="admin-usage-section-head">最近 30 天每日轮数</div>
+    ${daily.length ? `<div class="admin-usage-bars">${bars}</div>` : '<div style="color:var(--muted);font-size:11.5px;padding:6px">尚无用量数据</div>'}
+
+    <div class="admin-usage-section-head">最近审计（最多 60 条）</div>
+    <div class="admin-audit-list">${audit}</div>
+  `;
+}
+
+/* ── Role-based visibility ────────────────────────────────────────── */
+
+async function adminBootstrapMe(){
+  // Short-circuit on unauthenticated entry pages — fetching /api/me there
+  // would generate spurious 401s in the server log and the visibility hook
+  // has nothing to gate (those pages don't render the settings panel).
+  const _p = (typeof location !== 'undefined' && location.pathname) || '';
+  if(_p === '/login' || _p === '/init-admin' || _p.endsWith('/login') || _p.endsWith('/init-admin')){
+    return;
+  }
+  try{
+    const data = await api('/api/me');
+    _adminCurrentUser = (data && data.user) || null;
+  }catch(_){
+    _adminCurrentUser = null;
+  }
+  adminApplyRoleVisibility(_adminCurrentUser);
+}
+
+// Modal accessibility: Escape closes, and focus is trapped to the active
+// modal so Tab can't escape into the page behind. Registered once at module
+// load; works for both adminUserModal and adminUsageDrawer.
+function _adminWireModalA11y(){
+  document.addEventListener('keydown', (e) => {
+    if(e.key !== 'Escape') return;
+    const um = document.getElementById('adminUserModal');
+    const ud = document.getElementById('adminUsageDrawer');
+    if(ud && !ud.hidden){ adminCloseUsageDrawer(); e.preventDefault(); return; }
+    if(um && !um.hidden){ adminCloseUserModal(); e.preventDefault(); return; }
+  });
+  // Tab-trap: when the admin modal is open, keep focus inside it.
+  document.addEventListener('keydown', (e) => {
+    if(e.key !== 'Tab') return;
+    const open = [document.getElementById('adminUserModal'), document.getElementById('adminUsageDrawer')]
+      .find(m => m && !m.hidden);
+    if(!open) return;
+    const focusables = open.querySelectorAll(
+      'input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    if(!focusables.length) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if(e.shiftKey && document.activeElement === first){ last.focus(); e.preventDefault(); }
+    else if(!e.shiftKey && document.activeElement === last){ first.focus(); e.preventDefault(); }
+  });
+}
+
+function adminApplyRoleVisibility(user){
+  const isMultiUser = !!user;            // /api/me returned a real user
+  const isAdmin = !!(user && user.role === 'admin');
+  // Admin tab in settings sidebar — show only for admin.
+  document.querySelectorAll('.admin-only-menu').forEach(el => {
+    el.style.display = isAdmin ? '' : 'none';
+  });
+  // System-config tabs — hide from non-admin. Includes 'plugins' (the
+  // panel is read-only but lives in the same admin-curated bucket as
+  // providers/system; review-fix bug_033 for consistency).
+  ['providers','system','plugins'].forEach(key => {
+    const btn = document.querySelector(`#settingsMenu .side-menu-item[data-settings-section="${key}"]`);
+    if(btn) btn.style.display = isAdmin ? '' : 'none';
+    const pane = document.getElementById('settingsPane' + key.charAt(0).toUpperCase() + key.slice(1));
+    // Don't hide the pane container; just prevent switching to it. If currently active,
+    // bounce back to conversation so the user isn't stranded on a disallowed pane.
+    if(!isAdmin && pane && pane.classList.contains('active')){
+      switchSettingsSection('conversation');
+    }
+  });
+  // Profile switcher chip — disabled entirely in multi-user mode.
+  // /api/profile/switch always 403s now (impersonation is TBD), so showing
+  // a clickable chip would just produce a useless error toast every time.
+  // (#review-fix bug_023b)
+  if(isMultiUser){
+    const dd = document.getElementById('profileDropdown');
+    if(dd) dd.style.display = 'none';
+  }
+}
+
+// Run after DOM is ready; the script is loaded at the end of <body> so DOM is
+// already parsed by the time this runs, but readyState may still be 'loading'
+// when this file is evaluated very early.
+function _adminInitOnce(){
+  adminBootstrapMe();
+  _adminWireModalA11y();
+}
+if(document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', _adminInitOnce);
+} else {
+  _adminInitOnce();
+}
+

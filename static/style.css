@@ -3897,3 +3897,187 @@ main.main.showing-logs > #mainLogs{display:flex;}
 @media (prefers-reduced-motion: reduce){.stream-fade-word.is-new{animation:none;will-change:auto;}}
 [data-live-assistant="1"]:last-child .msg-body.stream-fade-active > :last-child::after,
 [data-live-assistant="1"]:last-child .msg-body.stream-fade-active:not(:has(> *))::after{display:none;content:none;}
+
+/* ───────────────────────────────────────────────────────────────────────
+   Multi-user admin panel
+   ─────────────────────────────────────────────────────────────────────── */
+.admin-table-wrap{
+  border:1px solid var(--border);border-radius:10px;overflow:hidden;
+  background:var(--code-bg);
+}
+.admin-table{
+  width:100%;border-collapse:collapse;font-size:13px;
+}
+.admin-table thead th{
+  text-align:left;padding:10px 14px;background:var(--panel-2,rgba(255,255,255,0.04));
+  font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+  border-bottom:1px solid var(--border);white-space:nowrap;
+}
+.admin-table tbody td{
+  padding:10px 14px;border-bottom:1px solid var(--border);vertical-align:middle;color:var(--text);
+}
+.admin-table tbody tr:last-child td{border-bottom:0;}
+.admin-table tbody tr:hover{background:rgba(124,185,255,0.04);}
+
+.admin-username{font-weight:600;color:var(--text);}
+.admin-username .me{font-size:10.5px;color:var(--accent);margin-left:6px;opacity:.85;letter-spacing:.08em;}
+.admin-profile-name{font-family:var(--mono,monospace);color:var(--muted);font-size:11px;margin-top:2px;}
+
+.admin-badge{
+  display:inline-block;padding:2px 8px;border-radius:99px;
+  font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  border:1px solid var(--border);
+}
+.admin-badge.role-admin{color:#e8a030;border-color:rgba(232,160,48,.4);background:rgba(232,160,48,.08);}
+.admin-badge.role-user{color:var(--accent);border-color:rgba(124,185,255,.35);background:rgba(124,185,255,.06);}
+.admin-badge.status-disabled{color:#ff5b6f;border-color:rgba(255,91,111,.4);background:rgba(255,91,111,.08);}
+.admin-badge.status-ok{color:#2bd68a;border-color:rgba(43,214,138,.35);background:rgba(43,214,138,.06);}
+
+.admin-quota-cell{
+  font-family:var(--mono,monospace);font-size:11.5px;color:var(--text);
+  display:flex;flex-direction:column;gap:2px;
+}
+.admin-quota-cell .meter{font-size:10.5px;color:var(--muted);}
+.admin-quota-cell .meter b{color:var(--text);font-weight:600;}
+
+.admin-row-actions{display:flex;gap:6px;white-space:nowrap;}
+.admin-row-actions .btn-row{
+  background:transparent;border:1px solid var(--border);
+  color:var(--text-soft,var(--text));border-radius:6px;
+  font-size:11.5px;padding:5px 10px;cursor:pointer;line-height:1;
+  transition:all .15s;
+}
+.admin-row-actions .btn-row:hover{background:var(--panel-2,rgba(255,255,255,0.04));border-color:var(--accent);color:var(--accent);}
+.admin-row-actions .btn-row.danger:hover{border-color:#ff5b6f;color:#ff5b6f;}
+
+/* Modal backdrop + dialog */
+.admin-modal-backdrop{
+  position:fixed;inset:0;z-index:9000;
+  display:flex;align-items:center;justify-content:center;
+  background:rgba(7,20,46,0.55);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  padding:24px;
+}
+.admin-modal-backdrop[hidden]{display:none;}
+.admin-modal{
+  width:100%;max-width:480px;max-height:90vh;overflow-y:auto;
+  background:var(--bg,#16213e);
+  border:1px solid var(--border);border-radius:14px;
+  padding:24px 24px 20px;color:var(--text);
+  box-shadow:0 30px 80px -20px rgba(0,0,0,0.6),0 0 0 1px rgba(255,255,255,0.03);
+}
+.admin-modal--wide{max-width:720px;}
+.admin-modal-head{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border);
+}
+.admin-modal-head h3{margin:0;font-size:16px;font-weight:600;letter-spacing:.02em;}
+.admin-modal-close{
+  background:transparent;border:0;color:var(--muted);
+  font-size:24px;cursor:pointer;padding:0 4px;line-height:1;
+  transition:color .15s;
+}
+.admin-modal-close:hover{color:var(--text);}
+
+.admin-modal-row{margin-bottom:14px;display:flex;flex-direction:column;gap:6px;}
+.admin-modal-row label{font-size:11.5px;color:var(--muted);font-weight:600;letter-spacing:.04em;}
+.admin-modal-row input[type="text"],
+.admin-modal-row input[type="password"],
+.admin-modal-row input[type="number"],
+.admin-modal-row select,
+.admin-modal-quota-row input[type="number"]{
+  width:100%;padding:9px 12px;background:var(--code-bg);color:var(--text);
+  border:1px solid var(--border2,var(--border));border-radius:8px;font-size:13.5px;outline:none;
+  font-family:inherit;transition:border-color .15s,box-shadow .15s;
+}
+.admin-modal-row input:focus,
+.admin-modal-row select:focus,
+.admin-modal-quota-row input:focus{
+  border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,185,255,0.16);
+}
+.admin-modal-hint{font-size:11px;color:var(--muted);line-height:1.5;}
+.admin-modal-hint code{font-family:var(--mono,monospace);color:var(--text);background:var(--code-bg);padding:1px 5px;border-radius:4px;}
+.admin-modal-check{display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;font-size:13px;color:var(--text);}
+.admin-modal-check input{margin:0;}
+
+.admin-modal-fieldset{
+  border:1px solid var(--border);border-radius:10px;
+  padding:12px 14px 6px;margin:18px 0 6px;
+}
+.admin-modal-fieldset legend{
+  padding:0 8px;font-size:11px;color:var(--muted);font-weight:600;
+  letter-spacing:.08em;text-transform:uppercase;
+}
+.admin-modal-quota-row{
+  display:grid;grid-template-columns:1fr 140px;align-items:center;gap:14px;margin-bottom:10px;
+}
+.admin-modal-quota-row label{font-size:12.5px;color:var(--text);font-weight:400;letter-spacing:0;text-transform:none;}
+
+.admin-modal-error{
+  display:none;margin-top:6px;padding:8px 12px;font-size:12px;
+  color:#ff5b6f;background:rgba(255,91,111,0.08);
+  border:1px solid rgba(255,91,111,0.28);border-radius:8px;
+}
+.admin-modal-error.show{display:block;}
+
+.admin-modal-actions{
+  display:flex;justify-content:flex-end;gap:8px;
+  margin-top:18px;padding-top:14px;border-top:1px solid var(--border);
+}
+
+/* Usage drawer body */
+.admin-usage-body{font-size:13px;line-height:1.5;color:var(--text);}
+.admin-usage-summary{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px;
+}
+.admin-usage-stat{
+  background:var(--code-bg);border:1px solid var(--border);border-radius:10px;
+  padding:12px 14px;
+}
+.admin-usage-stat .lbl{
+  font-size:10.5px;color:var(--muted);font-weight:600;
+  letter-spacing:.1em;text-transform:uppercase;
+}
+.admin-usage-stat .num{
+  font-family:var(--mono,monospace);font-size:20px;font-weight:500;
+  color:var(--text);margin-top:4px;letter-spacing:-.01em;
+}
+.admin-usage-stat .num .unit{font-size:11px;color:var(--muted);margin-left:4px;}
+
+.admin-usage-section-head{
+  font-size:11px;color:var(--muted);font-weight:600;
+  letter-spacing:.1em;text-transform:uppercase;margin:14px 0 8px;
+}
+
+.admin-usage-bars{display:flex;align-items:flex-end;gap:3px;height:80px;padding:6px 0;}
+.admin-usage-bar{
+  flex:1;background:rgba(124,185,255,0.18);border-radius:2px 2px 0 0;
+  min-height:2px;position:relative;transition:background .15s;
+}
+.admin-usage-bar:hover{background:var(--accent);}
+.admin-usage-bar .tip{
+  display:none;position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:4px 8px;font-size:10.5px;color:var(--text);white-space:nowrap;
+  font-family:var(--mono,monospace);
+}
+.admin-usage-bar:hover .tip{display:block;}
+
+.admin-audit-list{
+  max-height:240px;overflow-y:auto;font-size:12px;font-family:var(--mono,monospace);
+  background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;
+}
+.admin-audit-row{display:grid;grid-template-columns:120px 140px 1fr;gap:10px;padding:3px 0;color:var(--text);}
+.admin-audit-row .ts{color:var(--muted);}
+.admin-audit-row .ev{color:var(--accent);}
+.admin-audit-row.quota_blocked .ev{color:#ff5b6f;}
+
+/* Skills panel: scope badge */
+.skill-scope-badge{
+  display:inline-block;font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  padding:1px 6px;border-radius:99px;margin-left:8px;vertical-align:1px;
+  border:1px solid var(--border);color:var(--muted);
+}
+.skill-scope-badge.global{
+  color:#e8a030;border-color:rgba(232,160,48,.4);background:rgba(232,160,48,.08);
+}
+

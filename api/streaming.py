@@ -19,6 +19,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Once-per-process dedup for quota-gate failure warnings. See the broad
+# `except` in _run_agent_streaming's pre-register quota gate — without this
+# a recurring failure (locked DB, ImportError, etc.) would either flood
+# the log every chat turn or be invisible at DEBUG level. (#review-fix bug_039)
+_QUOTA_GATE_WARNED: set = set()
+
 from api.config import (
     get_config,
     STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, STREAM_PARTIAL_TEXT,
@@ -2230,6 +2236,95 @@ def _run_agent_streaming(
     q = STREAMS.get(stream_id)
     if q is None:
         return
+
+    # ── Multi-user quota gate (PRE-register) ────────────────────────────
+    # Runs BEFORE register_active_run / journal write / cancel-flag setup,
+    # so a quota-blocked turn never enters the lifecycle and there's nothing
+    # to unwind. On block we emit a single SSE error+done pair so the client
+    # tears down the stream, then pop the STREAMS entry that the caller
+    # pre-registered and return.
+    #
+    # _quota_user_id is declared HERE (not inside the main try) so the
+    # outer `finally` at the end of this function can still write a
+    # turn_end audit row even after the gate passed.
+    #
+    # (Previously there was a parallel _quota_turn_status string intended
+    # to record error/cancel/timeout outcomes, but no code path ever
+    # mutated it — every turn audited as 'ok'. Removed; record_turn_end
+    # is success-only by design. If granular turn outcomes are needed
+    # later, wire them at the actual exception/cancel sites with explicit
+    # status arg + an audit-side schema migration.)
+    _quota_user_id: int | None = None
+    try:
+        from api import users as _users_mod
+        from api import quotas as _quotas_mod
+        from api.profiles import _resolve_profile_home_for_name as _resolve_phome
+
+        _s_meta = None
+        try:
+            _s_meta = get_session(session_id, metadata_only=True)
+        except KeyError:
+            _s_meta = None
+        except TypeError:
+            # get_session lacks metadata_only — fall back to full load.
+            try:
+                _s_meta = get_session(session_id)
+            except KeyError:
+                _s_meta = None
+        _session_profile = (getattr(_s_meta, 'profile', None) if _s_meta else None) or 'default'
+        _owner = _users_mod.get_user_by_profile_name(_session_profile)
+        if _owner:
+            _quota_user_id = int(_owner['id'])
+            _profile_dir = _resolve_phome(_owner['profile_name'])
+            _blocked = _quotas_mod.check_and_reserve(
+                _owner, session_id, _profile_dir,
+            )
+            if _blocked:
+                try:
+                    q.put_nowait(('error', {
+                        'code': 'quota',
+                        'reason': _blocked.get('reason'),
+                        'detail': _blocked,
+                        'message': f"Quota exceeded: {_blocked.get('reason')}",
+                    }))
+                    # Terminate the SSE stream cleanly so the client closes
+                    # without waiting for a heartbeat timeout.
+                    q.put_nowait(('done', {'session_id': session_id, 'quota_blocked': True}))
+                except Exception:
+                    pass
+                with STREAMS_LOCK:
+                    STREAMS.pop(stream_id, None)
+                # Reset _quota_user_id so the outer finally doesn't double-
+                # audit a turn_end for a quota-blocked attempt — the
+                # check_and_reserve audit already recorded 'quota_blocked'.
+                _quota_user_id = None
+                return
+        elif _session_profile and _session_profile != 'default':
+            # Profile exists but no owner — likely orphaned (user was deleted
+            # before their cron jobs / messaging turns drained). Allowing the
+            # turn would silently bypass quota; log loudly so operators notice.
+            logger.warning(
+                "[webui] quota gate: orphan profile %r has no owning user; "
+                "turn proceeds without quota accounting (session=%s)",
+                _session_profile, session_id,
+            )
+    except Exception as _quota_gate_exc:
+        # SECURITY: any failure here means quota is NOT enforced for this
+        # turn. The previous code logged at DEBUG (invisible at default
+        # WARNING threshold), so a broken import / locked DB / refactor
+        # bug would silently disable accounting forever. Log at WARNING
+        # with once-per-process dedup so operators see it without log
+        # spam. (#review-fix bug_039)
+        _key = (type(_quota_gate_exc).__name__, str(_quota_gate_exc)[:80])
+        if _key not in _QUOTA_GATE_WARNED:
+            _QUOTA_GATE_WARNED.add(_key)
+            logger.warning(
+                "[webui] QUOTA GATE DISABLED FOR THIS TURN — %r. "
+                "Further occurrences with the same signature will not be re-logged. "
+                "If multi-user enforcement matters, investigate immediately.",
+                _quota_gate_exc, exc_info=True,
+            )
+
     register_active_run(
         stream_id,
         session_id=session_id,
@@ -2428,6 +2523,11 @@ def _run_agent_streaming(
     _checkpoint_stop = None
     _ckpt_thread = None
     _agent_lock = None
+    # NOTE: multi-user quota gate moved ABOVE register_active_run (search
+    # for "PRE-register" near the top of this function). The gate's
+    # _quota_user_id / _quota_turn_status locals are visible here because
+    # they're declared at function scope; the finally below uses them to
+    # write the turn_end audit row.
     try:
         s = get_session(session_id)
         update_active_run(stream_id, phase="running", session_id=session_id)
@@ -4407,6 +4507,15 @@ def _run_agent_streaming(
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         _clear_thread_env()  # TD1: always clear thread-local context
+        # Multi-user: write the final audit row for this turn (best-effort).
+        # The quota-blocked path resets _quota_user_id to None before
+        # returning, so we only get here for turns the gate let through.
+        if _quota_user_id is not None:
+            try:
+                from api import quotas as _quotas_mod
+                _quotas_mod.record_turn_end(_quota_user_id, session_id, status='ok')
+            except Exception:
+                logger.debug("record_turn_end failed", exc_info=True)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)

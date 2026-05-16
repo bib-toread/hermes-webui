@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Initialize Admin — Hermes</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#1a1a2e;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:#16213e;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;
+  width:420px;max-width:100%;box-shadow:0 8px 32px rgba(0,0,0,.3)}
+.logo{width:48px;height:48px;border-radius:12px;background:linear-gradient(145deg,#e8a030,#e94560);
+  display:flex;align-items:center;justify-content:center;font-weight:800;font-size:20px;color:#fff;
+  margin:0 auto 14px;box-shadow:0 2px 12px rgba(233,69,96,.3)}
+h1{font-size:20px;font-weight:600;margin-bottom:6px;text-align:center}
+.sub{font-size:13px;color:#8888aa;margin-bottom:24px;text-align:center;line-height:1.5}
+label{display:block;font-size:12px;color:#a0a0c0;margin-bottom:6px;margin-top:14px;font-weight:500}
+input,select{width:100%;padding:10px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);
+  background:rgba(255,255,255,.04);color:#e8e8f0;font-size:14px;outline:none;
+  transition:border-color .15s}
+input:focus,select:focus{border-color:rgba(124,185,255,.5);box-shadow:0 0 0 3px rgba(124,185,255,.1)}
+button{width:100%;padding:11px;border-radius:10px;border:1px solid rgba(124,185,255,.3);
+  background:rgba(124,185,255,.15);color:#7cb9ff;font-size:14px;font-weight:600;cursor:pointer;
+  margin-top:20px;transition:all .15s}
+button:hover{background:rgba(124,185,255,.25)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.err{color:#e94560;font-size:12px;margin-top:14px;display:none;text-align:center;line-height:1.4}
+.hint{color:#8888aa;font-size:11px;margin-top:4px;line-height:1.4}
+</style></head><body>
+<div class="card">
+  <div class="logo">H</div>
+  <h1>Initialize Admin</h1>
+  <p class="sub">No users exist yet. Create the first administrator account to continue. You'll be able to add more users from the admin panel afterwards.</p>
+  <form id="init-form">
+    <label for="username">Admin username</label>
+    <input type="text" id="username" autocomplete="username" autocapitalize="none"
+      autocorrect="off" spellcheck="false" pattern="[a-z0-9][a-z0-9_\-]{2,31}"
+      placeholder="e.g. alice" autofocus required>
+    <div class="hint">3-32 chars, lowercase letters/digits/_/- only, must start alnum.</div>
+
+    <label for="password">Password</label>
+    <input type="password" id="password" autocomplete="new-password" minlength="4" required>
+
+    <label for="adopt">Adopt existing profile (optional)</label>
+    <select id="adopt"></select>
+    <div class="hint">Choose an existing profile to take ownership of its sessions/skills, or create a fresh one named <code>user_&lt;username&gt;</code>.</div>
+
+    <button type="submit" id="submit-btn">Create admin & continue</button>
+  </form>
+  <div class="err" id="err"></div>
+</div>
+<script>
+(function(){
+  var form = document.getElementById('init-form');
+  var unameEl = document.getElementById('username');
+  var pwEl = document.getElementById('password');
+  var adoptEl = document.getElementById('adopt');
+  var btn = document.getElementById('submit-btn');
+  var errEl = document.getElementById('err');
+
+  function showErr(msg){ errEl.textContent = msg; errEl.style.display = 'block'; }
+  function hideErr(){ errEl.style.display = 'none'; }
+
+  function populateProfiles(profiles){
+    adoptEl.innerHTML = '';
+    var optNew = document.createElement('option');
+    optNew.value = '__new__';
+    optNew.textContent = '— Create a new profile —';
+    adoptEl.appendChild(optNew);
+    (profiles || []).forEach(function(p){
+      var o = document.createElement('option');
+      o.value = p.name;
+      o.textContent = p.name + (p.path ? '  (' + p.path + ')' : '');
+      adoptEl.appendChild(o);
+    });
+  }
+
+  fetch('/api/init-admin/status', {credentials: 'include'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.needs_init) {
+        window.location.href = '/login';
+        return;
+      }
+      populateProfiles(d.existing_profiles || []);
+    })
+    .catch(function(){ showErr('Cannot reach server.'); });
+
+  form.addEventListener('submit', function(e){
+    e.preventDefault();
+    hideErr();
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    var body = {
+      username: unameEl.value.trim().toLowerCase(),
+      password: pwEl.value,
+      adopt_profile: adoptEl.value || '__new__',
+    };
+    fetch('/api/init-admin/create', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+      credentials: 'include',
+    }).then(function(r){
+      return r.json().then(function(d){ return {ok: r.ok, data: d}; });
+    }).then(function(res){
+      if (res.ok && res.data && res.data.ok) {
+        window.location.href = '/';
+      } else {
+        showErr((res.data && res.data.error) || 'Failed to create admin.');
+        btn.disabled = false;
+        btn.textContent = 'Create admin & continue';
+      }
+    }).catch(function(){
+      showErr('Connection failed.');
+      btn.disabled = false;
+      btn.textContent = 'Create admin & continue';
+    });
+  });
+})();
+</script>
+</body></html>

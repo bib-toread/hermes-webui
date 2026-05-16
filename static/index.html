@@ -300,6 +300,10 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/></svg>
           <span>System</span>
         </button>
+        <button type="button" class="side-menu-item admin-only-menu" data-settings-section="admin" onclick="switchSettingsSection('admin')" style="display:none">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1l9 4v7c0 5-3.9 9.7-9 11-5.1-1.3-9-6-9-11V5l9-4z"/><path d="M9 12l2 2 4-4"/></svg>
+          <span>Admin</span>
+        </button>
       </div>
     </div>
   <div class="resize-handle" id="sidebarResize"></div>
@@ -1187,6 +1191,26 @@
             </div>
             <button class="sm-btn" onclick="saveSettings()" style="margin-top:12px;width:100%;padding:8px;font-weight:600" data-i18n="settings_save_btn">Save Settings</button>
           </div>
+          <!-- ── Admin pane (multi-user management) ────────────────────── -->
+          <div class="settings-pane" id="settingsPaneAdmin">
+            <div class="settings-section-head">
+              <div>
+                <div class="settings-section-title">用户管理</div>
+                <div class="settings-section-meta">创建、编辑、停用用户，查看用量与配额。仅管理员可见。</div>
+              </div>
+              <div style="display:flex;gap:6px">
+                <button type="button" class="sm-btn" id="btnAdminRefresh" onclick="loadAdminPanel(true)" title="刷新">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                  <span>刷新</span>
+                </button>
+                <button type="button" class="sm-btn" id="btnAdminCreateUser" onclick="adminOpenUserModal(null)" style="color:var(--accent);border-color:rgba(124,185,255,.35);font-weight:600">
+                  + 新建用户
+                </button>
+              </div>
+            </div>
+            <div id="adminUsersStatus" style="font-size:12px;color:var(--muted);margin-bottom:8px">加载中…</div>
+            <div id="adminUsersTableWrap" class="admin-table-wrap"></div>
+          </div>
       </div>
     </div>
   </main>
@@ -1363,5 +1387,91 @@
     </div>
   </div>
 </div>
+
+<!-- ── Admin: Create/Edit user modal ─────────────────────────────────── -->
+<div class="admin-modal-backdrop" id="adminUserModal" hidden onclick="if(event.target===this)adminCloseUserModal()">
+  <div class="admin-modal" role="dialog" aria-modal="true" aria-labelledby="adminUserModalTitle">
+    <div class="admin-modal-head">
+      <h3 id="adminUserModalTitle">新建用户</h3>
+      <button type="button" class="admin-modal-close" onclick="adminCloseUserModal()" aria-label="关闭">×</button>
+    </div>
+    <form id="adminUserForm" onsubmit="adminSubmitUserModal(event)">
+      <input type="hidden" id="adminUserModalId" value="">
+
+      <div class="admin-modal-row">
+        <label for="adminUserModalUsername">用户名</label>
+        <input type="text" id="adminUserModalUsername" autocapitalize="none" autocorrect="off" spellcheck="false"
+               pattern="[a-z0-9][a-z0-9_\-]{2,31}" required
+               placeholder="3-32 字符, 小写字母/数字/_/-">
+        <div class="admin-modal-hint">已创建后不可修改。会自动生成 profile <code>user_&lt;用户名&gt;</code>。</div>
+      </div>
+
+      <div class="admin-modal-row">
+        <label for="adminUserModalPassword">密码 <span id="adminUserModalPwOpt" style="color:var(--muted);font-weight:400;font-size:11px"></span></label>
+        <input type="password" id="adminUserModalPassword" autocomplete="new-password" minlength="4">
+        <div class="admin-modal-hint" id="adminUserModalPwHint">至少 4 字符。</div>
+      </div>
+
+      <div class="admin-modal-row">
+        <label for="adminUserModalRole">角色</label>
+        <select id="adminUserModalRole">
+          <option value="user">普通用户</option>
+          <option value="admin">管理员</option>
+        </select>
+      </div>
+
+      <div class="admin-modal-row" id="adminUserModalDisabledRow" style="display:none">
+        <label class="admin-modal-check">
+          <input type="checkbox" id="adminUserModalDisabled">
+          <span>停用账号（保留数据，无法登录）</span>
+        </label>
+      </div>
+
+      <div class="admin-modal-row" id="adminUserModalProfileRow" style="display:none">
+        <label for="adminUserModalProfile">Profile 名称</label>
+        <input type="text" id="adminUserModalProfile" pattern="[a-z0-9][a-z0-9_\-]{0,63}"
+               placeholder="user_&lt;username&gt;">
+        <div class="admin-modal-hint">改成磁盘上某个孤儿 profile 的名字即可<b>转交</b>该 profile 给这个用户（含 sessions / skills / 工作区 / 记忆）。<br><b>谨慎修改</b>，原 profile 会断开关联。</div>
+      </div>
+
+      <fieldset class="admin-modal-fieldset">
+        <legend>配额</legend>
+        <div class="admin-modal-quota-row">
+          <label for="adminQuotaTurns">每日对话轮数</label>
+          <input type="number" id="adminQuotaTurns" min="0" step="1" value="200">
+        </div>
+        <div class="admin-modal-quota-row">
+          <label for="adminQuotaConcur">最大并发 session</label>
+          <input type="number" id="adminQuotaConcur" min="0" step="1" value="5">
+        </div>
+        <div class="admin-modal-quota-row">
+          <label for="adminQuotaStorage">最大存储 (MB)</label>
+          <input type="number" id="adminQuotaStorage" min="0" step="1" value="2048">
+        </div>
+      </fieldset>
+
+      <div class="admin-modal-error" id="adminUserModalError" aria-live="polite"></div>
+      <div class="admin-modal-actions">
+        <button type="button" class="btn secondary" onclick="adminCloseUserModal()">取消</button>
+        <button type="submit" class="btn primary" id="adminUserModalSubmit">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ── Admin: Per-user usage drawer ─────────────────────────────────── -->
+<div class="admin-modal-backdrop" id="adminUsageDrawer" hidden onclick="if(event.target===this)adminCloseUsageDrawer()">
+  <div class="admin-modal admin-modal--wide" role="dialog" aria-modal="true" aria-labelledby="adminUsageTitle">
+    <div class="admin-modal-head">
+      <h3 id="adminUsageTitle">用量详情</h3>
+      <button type="button" class="admin-modal-close" onclick="adminCloseUsageDrawer()" aria-label="关闭">×</button>
+    </div>
+    <div id="adminUsageBody" class="admin-usage-body">加载中…</div>
+    <div class="admin-modal-actions">
+      <button type="button" class="btn secondary" onclick="adminCloseUsageDrawer()">关闭</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>

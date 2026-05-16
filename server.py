@@ -111,13 +111,15 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-from api.auth import check_auth
+from api.auth import check_auth, current_user
 from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
 from api.helpers import j, get_profile_cookie
 from api.profiles import set_request_profile, clear_request_profile
 from api.routes import handle_delete, handle_get, handle_patch, handle_post
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
+from api import users as _users
+from api.users import bind_request_user, clear_request_user
 
 
 class QuietHTTPServer(ThreadingHTTPServer):
@@ -239,14 +241,50 @@ class Handler(BaseHTTPRequestHandler):
         })
         print(f'[webui] {record}', flush=True)
 
-    def do_GET(self) -> None:
-        self._req_t0 = time.time()
-        # Per-request profile context from cookie (issue #798)
+    def _bind_user_and_profile(self) -> None:
+        """Resolve the request's user and pin the thread to that user's profile.
+
+        Multi-user: the active profile is no longer the value of the
+        hermes_profile cookie — it's whichever profile the authenticated user
+        owns. Falls back to legacy cookie behaviour ONLY when there is no
+        authenticated user (e.g. /login, /init-admin, /static/*), so the
+        existing cookie-driven flows for unauthenticated pages continue to work.
+        """
+        user = None
+        try:
+            user = current_user(self)
+        except Exception:
+            user = None
+        bind_request_user(user)
+        if user and user.get('profile_name'):
+            set_request_profile(user['profile_name'])
+            return
         cookie_profile = get_profile_cookie(self)
         if cookie_profile:
             set_request_profile(cookie_profile)
+
+    def _clear_per_request_user_cache(self) -> None:
+        """SECURITY: drop the per-request user cache (handler._user) so the
+        next request on a keep-alive connection re-resolves identity from
+        the cookie. Without this, BaseHTTPRequestHandler reuses the same
+        instance per TCP connection and request N+1 sees request N's
+        cached user — surviving logout, role changes, and admin-side
+        invalidate_sessions_for_user. (#review-fix bug_011)"""
+        try:
+            del self._user
+        except AttributeError:
+            pass
+
+    def do_GET(self) -> None:
+        self._req_t0 = time.time()
         try:
             parsed = urlparse(self.path)
+            # Single bind: current_user() is cached on handler._user, so
+            # downstream callers re-using current_user(handler) hit the
+            # cache rather than re-querying the session DB. The bind must
+            # happen BEFORE check_auth so check_auth's init-admin gate
+            # runs with the right thread-local profile.
+            self._bind_user_and_profile()
             if not check_auth(self, parsed): return
             result = handle_get(self, parsed)
             if result is False:
@@ -256,15 +294,14 @@ class Handler(BaseHTTPRequestHandler):
             return j(self, {'error': 'Internal server error'}, status=500)
         finally:
             clear_request_profile()
+            clear_request_user()
+            self._clear_per_request_user_cache()
 
     def _handle_write(self, route_func) -> None:
         self._req_t0 = time.time()
-        # Per-request profile context from cookie (issue #798)
-        cookie_profile = get_profile_cookie(self)
-        if cookie_profile:
-            set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
+            self._bind_user_and_profile()
             # Stage-346 Opus SHOULD-FIX defense-in-depth: scope the CSP-report
             # auth carve-out to POST only. The endpoint is intentionally
             # unauthenticated (browsers omit cookies on CSP reports), but the
@@ -282,6 +319,8 @@ class Handler(BaseHTTPRequestHandler):
             return j(self, {'error': 'Internal server error'}, status=500)
         finally:
             clear_request_profile()
+            clear_request_user()
+            self._clear_per_request_user_cache()
 
     def do_POST(self) -> None:
         self._handle_write(handle_post)
@@ -339,6 +378,17 @@ def main() -> None:
 
     # Fix sensitive file permissions before doing anything else
     fix_credential_permissions()
+
+    # Multi-user: ensure users.db schema exists and sweep stale concurrency rows.
+    try:
+        _users.ensure_schema()
+        dropped = _users.sweep_stale_active_sessions()
+        if dropped:
+            print(f"[ok] Multi-user: pruned {dropped} stale sessions_active rows.", flush=True)
+        if not _users.has_any_user():
+            print("[!!] Multi-user: no users yet — visit http://%s:%s/init-admin to create the first admin." % (HOST, PORT), flush=True)
+    except Exception as exc:
+        print(f"[!!] Multi-user schema init failed: {exc}", flush=True)
 
     # ── #1558 startup self-heal ─────────────────────────────────────────
     # If a previous process wrote a session JSON with fewer messages than
