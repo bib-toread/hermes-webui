@@ -3681,6 +3681,20 @@ def handle_get(handler, parsed) -> bool:
             'options': list(_gc.VALID_OUTPUT_LANGUAGES),
         })
 
+    if parsed.path == "/api/admin/skills/mine":
+        # List the skills in the requesting admin's profile so the admin
+        # UI can render a checkbox picker for sync-to-global. Returns
+        # ``{skills: [{label, name, category}], count}``.
+        if not _admin_or_403(handler):
+            return True
+        from api.auth import current_user as _cur_user
+        admin_user = _cur_user(handler)
+        if not admin_user:
+            return bad(handler, "admin user not resolvable", status=500)
+        from api.global_skills import list_profile_skills
+        skills = list_profile_skills(admin_user['profile_name'])
+        return j(handler, {'skills': skills, 'count': len(skills)})
+
     if parsed.path == "/login":
         # The 筑保-design template is hardcoded zh-CN and uses only three
         # template variables: WEBUI_VERSION (cache-bust + footer) and the
@@ -5620,11 +5634,15 @@ def handle_post(handler, parsed) -> bool:
         return j(handler, result)
 
     if parsed.path == "/api/admin/skills/sync-to-global":
-        # Push every skill in the requesting admin's profile skills/ dir
+        # Push selected (or all) skills in the requesting admin's profile
         # to ~/.hermes/global/skills/ so all users see them. Merge
-        # semantics — global-only skills (admin doesn't have locally) are
-        # untouched. Skills with the same name in global get overwritten
-        # with the admin's current version.
+        # semantics — skills NOT in the push set are left alone in global.
+        # Same-name skills in global get overwritten with admin's current
+        # version.
+        #
+        # Body: ``{names: ['skill-a', 'cat/skill-b', ...]}`` to push a
+        # specific subset; omit/empty `names` to push every skill in the
+        # admin's profile.
         if not _admin_or_403(handler):
             return True
         from api.auth import current_user as _cur_user
@@ -5632,8 +5650,13 @@ def handle_post(handler, parsed) -> bool:
         if not admin_user:
             return bad(handler, "admin user not resolvable", status=500)
         from api.global_skills import sync_profile_skills_to_global
+        only = None
+        if isinstance(body, dict):
+            raw = body.get('names')
+            if isinstance(raw, list):
+                only = [s for s in raw if isinstance(s, str) and s]
         try:
-            result = sync_profile_skills_to_global(admin_user['profile_name'])
+            result = sync_profile_skills_to_global(admin_user['profile_name'], only=only)
         except Exception as exc:
             logger.exception("sync_profile_skills_to_global failed")
             return bad(handler, str(exc), status=500)

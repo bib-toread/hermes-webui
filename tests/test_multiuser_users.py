@@ -473,6 +473,46 @@ class TestSeedDefaultWorkspace(unittest.TestCase):
             'NEW',
         )
 
+    def test_list_profile_skills(self):
+        """list_profile_skills returns labels suitable for the sync picker UI."""
+        from api.global_skills import list_profile_skills
+        skills_dir = self.profile_home / 'skills'
+        (skills_dir / 'standalone').mkdir(parents=True, exist_ok=True)
+        (skills_dir / 'standalone' / 'SKILL.md').write_text('x', encoding='utf-8')
+        (skills_dir / 'BUSINESS' / 'policy').mkdir(parents=True, exist_ok=True)
+        (skills_dir / 'BUSINESS' / 'policy' / 'SKILL.md').write_text('y', encoding='utf-8')
+        listed = list_profile_skills('user_seedtest')
+        labels = sorted(s['label'] for s in listed)
+        self.assertEqual(labels, ['BUSINESS/policy', 'standalone'])
+        # category metadata preserved for UI grouping
+        by_label = {s['label']: s for s in listed}
+        self.assertIsNone(by_label['standalone']['category'])
+        self.assertEqual(by_label['BUSINESS/policy']['category'], 'BUSINESS')
+
+    def test_sync_only_filter_pushes_subset(self):
+        """When only=[...] is given, only the listed labels are synced."""
+        from api.global_skills import sync_profile_skills_to_global, global_skills_dir
+        skills_dir = self.profile_home / 'skills'
+        for n in ('keep', 'skip-me'):
+            (skills_dir / n).mkdir(parents=True, exist_ok=True)
+            (skills_dir / n / 'SKILL.md').write_text(f'# {n}', encoding='utf-8')
+
+        result = sync_profile_skills_to_global('user_seedtest', only=['keep'])
+        self.assertEqual(result['synced'], ['keep'])
+        self.assertEqual(result['skipped'], [])
+        gdir = global_skills_dir()
+        self.assertTrue((gdir / 'keep' / 'SKILL.md').exists())
+        self.assertFalse((gdir / 'skip-me' / 'SKILL.md').exists())
+
+    def test_sync_only_with_missing_label_reports_skipped(self):
+        """A label not present in source profile lands in skipped (not crash)."""
+        from api.global_skills import sync_profile_skills_to_global
+        result = sync_profile_skills_to_global('user_seedtest',
+                                                only=['does-not-exist'])
+        self.assertEqual(result['synced'], [])
+        self.assertEqual(len(result['skipped']), 1)
+        self.assertIn('not found', result['skipped'][0]['error'])
+
     def test_sync_preserves_global_only_skills(self):
         """Skills that exist ONLY in global (admin doesn't have locally)
         must not be deleted — merge semantics, not mirror semantics."""

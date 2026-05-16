@@ -7137,8 +7137,10 @@ async function loadAdminPanel(forceRefresh){
   const status = document.getElementById('adminUsersStatus');
   const wrap = document.getElementById('adminUsersTableWrap');
   if(!status || !wrap) return;
-  // Load output-language dropdown state in parallel with the user list.
+  // Load output-language dropdown + skills-to-sync list in parallel with
+  // the user list.
   adminLoadOutputLanguage();
+  adminLoadSkillsToSync();
   if(!forceRefresh && _adminUsersCache){
     adminRenderUsersTable(_adminUsersCache);
     return;
@@ -7178,15 +7180,87 @@ async function adminLoadOutputLanguage(){
   }
 }
 
-async function adminSyncSkillsToGlobal(){
+let _adminSyncSkillsCache = [];   // [{label, name, category}, ...]
+
+async function adminLoadSkillsToSync(){
+  const wrap = document.getElementById('adminSyncSkillsList');
+  const stat = document.getElementById('adminSyncSkillsStatus');
+  if(!wrap) return;
+  wrap.innerHTML = '<div style="padding:14px;text-align:center;color:var(--muted);font-size:11.5px">加载中…</div>';
+  if(stat){ stat.textContent = ''; }
+  try{
+    const data = await api('/api/admin/skills/mine');
+    _adminSyncSkillsCache = (data && data.skills) || [];
+    _adminRenderSyncSkillsList();
+  }catch(e){
+    wrap.innerHTML = `<div style="padding:14px;text-align:center;color:#ff5b6f;font-size:11.5px">加载失败：${_adminEsc(e && e.message || e)}</div>`;
+  }
+}
+
+function _adminRenderSyncSkillsList(){
+  const wrap = document.getElementById('adminSyncSkillsList');
+  if(!wrap) return;
+  const skills = _adminSyncSkillsCache;
+  if(!skills.length){
+    wrap.innerHTML = '<div style="padding:14px;text-align:center;color:var(--muted);font-size:11.5px">你的 profile 里没有可推送的技能</div>';
+    _adminUpdateSyncSelectedCount();
+    return;
+  }
+  // Group by category for nicer display.
+  const byCat = {};
+  for(const s of skills){
+    const cat = s.category || '(uncategorized)';
+    (byCat[cat] = byCat[cat] || []).push(s);
+  }
+  const html = Object.keys(byCat).sort().map(cat => {
+    const rows = byCat[cat].map(s => `
+      <label style="display:flex;align-items:center;gap:8px;padding:4px 8px;cursor:pointer;border-radius:5px" onmouseover="this.style.background='rgba(124,185,255,0.06)'" onmouseout="this.style.background='transparent'">
+        <input type="checkbox" class="admin-sync-skill-cb" value="${_adminEsc(s.label)}" onchange="_adminUpdateSyncSelectedCount()">
+        <span style="font-family:var(--mono,monospace);color:var(--text);font-size:12px">${_adminEsc(s.name)}</span>
+      </label>
+    `).join('');
+    return `
+      <div style="margin:4px 0">
+        <div style="font-size:10.5px;color:var(--muted);font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:4px 8px">${_adminEsc(cat)}</div>
+        ${rows}
+      </div>
+    `;
+  }).join('');
+  wrap.innerHTML = html;
+  _adminUpdateSyncSelectedCount();
+}
+
+function adminToggleAllSyncSkills(checked){
+  document.querySelectorAll('.admin-sync-skill-cb').forEach(cb => { cb.checked = checked; });
+  _adminUpdateSyncSelectedCount();
+}
+
+function _adminUpdateSyncSelectedCount(){
+  const cbs = document.querySelectorAll('.admin-sync-skill-cb:checked');
+  const n = cbs.length;
+  const btn = document.getElementById('btnSyncSkillsToGlobal');
+  const counter = document.getElementById('adminSyncSelectedCount');
+  if(btn){
+    btn.textContent = `推送选中的 ${n} 个到全局`;
+    btn.disabled = n === 0;
+  }
+  if(counter){
+    const total = _adminSyncSkillsCache.length;
+    counter.textContent = total ? `已选 ${n} / ${total}` : '';
+  }
+}
+
+async function adminSyncSelectedSkills(){
+  const cbs = document.querySelectorAll('.admin-sync-skill-cb:checked');
+  const names = Array.from(cbs).map(cb => cb.value);
+  if(!names.length) return;
   const btn = document.getElementById('btnSyncSkillsToGlobal');
   const stat = document.getElementById('adminSyncSkillsStatus');
-  if(!btn) return;
   const ok = confirm(
-    '将你（admin）profile 中的所有技能复制到全局共享目录。\n\n'
+    `将选中的 ${names.length} 个技能推送到全局共享目录。\n\n`
     + '• 所有用户立即可见\n'
-    + '• 同名技能会被覆盖（用你的当前版本）\n'
-    + '• 全局中你本地没有的技能不会被删除\n\n'
+    + '• 同名技能会被你的版本覆盖\n'
+    + '• 没选中的技能不会被改动\n\n'
     + '确认继续？'
   );
   if(!ok) return;
@@ -7196,15 +7270,12 @@ async function adminSyncSkillsToGlobal(){
   if(stat){ stat.style.color = 'var(--muted)'; stat.textContent = ''; }
   try{
     const data = await api('/api/admin/skills/sync-to-global', {
-      method: 'POST', body: '{}',
+      method: 'POST', body: JSON.stringify({ names }),
     });
     const count = (data && data.count) || 0;
     const skipped = (data && data.skipped) || [];
     if(stat){
-      if(count === 0 && skipped.length === 0){
-        stat.style.color = 'var(--muted)';
-        stat.textContent = '没有可推送的技能（admin profile 的 skills/ 目录为空）';
-      }else if(skipped.length === 0){
+      if(skipped.length === 0){
         stat.style.color = '#2bd68a';
         stat.textContent = `✓ 已推送 ${count} 个技能到全局（所有用户可见）`;
       }else{
@@ -7212,14 +7283,16 @@ async function adminSyncSkillsToGlobal(){
         stat.textContent = `部分成功：${count} 个推送成功，${skipped.length} 个失败 — ${skipped.map(s => s.name || s).join(', ')}`;
       }
     }
+    // Clear selection so admin doesn't accidentally re-push.
+    adminToggleAllSyncSkills(false);
   }catch(e){
     if(stat){
       stat.style.color = '#ff5b6f';
       stat.textContent = '推送失败：' + (e && e.message || e);
     }
   }finally{
-    btn.disabled = false;
-    btn.textContent = originalLabel;
+    btn.disabled = (document.querySelectorAll('.admin-sync-skill-cb:checked').length === 0);
+    if(btn.disabled) btn.textContent = originalLabel.replace(/\d+/, '0');
   }
 }
 

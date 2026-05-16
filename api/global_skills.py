@@ -50,8 +50,38 @@ def scope_of_path(p: Path) -> str:
     return 'global' if is_global_skill_path(p) else 'user'
 
 
-def sync_profile_skills_to_global(profile_name: str) -> dict:
-    """Copy every skill from *profile_name*'s skills/ dir into the global
+def list_profile_skills(profile_name: str) -> list[dict]:
+    """List all skills in *profile_name*'s skills/ dir.
+
+    Returns ``[{label, name, category}]`` for each discovered SKILL.md.
+    *label* is the rel path used to identify the skill in sync calls
+    (``"<name>"`` or ``"<category>/<name>"``); the UI uses *category*
+    + *name* for display, the API uses *label* for selection.
+    """
+    src = _resolve_profile_home_for_name(profile_name) / 'skills'
+    if not src.exists() or not src.is_dir():
+        return []
+    out: list[dict] = []
+    for entry in sorted(src.iterdir()):
+        if not entry.is_dir():
+            continue
+        if (entry / 'SKILL.md').is_file():
+            out.append({'label': entry.name, 'name': entry.name, 'category': None})
+            continue
+        for sub in sorted(entry.iterdir()):
+            if not sub.is_dir() or not (sub / 'SKILL.md').is_file():
+                continue
+            out.append({
+                'label': f"{entry.name}/{sub.name}",
+                'name': sub.name,
+                'category': entry.name,
+            })
+    return out
+
+
+def sync_profile_skills_to_global(profile_name: str,
+                                   only: list | None = None) -> dict:
+    """Copy skills from *profile_name*'s skills/ dir into the global
     skills root, overwriting same-named entries.
 
     Walks the standard layout (``<skills>/<name>/SKILL.md`` and
@@ -59,34 +89,69 @@ def sync_profile_skills_to_global(profile_name: str) -> dict:
     subdirectory (so linked files / sub-resources travel with SKILL.md),
     and reports what was synced.
 
+    *only* — when None (default), every skill in the profile is synced.
+    When a list of labels (``"name"`` or ``"category/name"``) is given,
+    ONLY those skills are pushed; unknown labels land in ``skipped`` with
+    ``reason: 'not found in source profile'``.
+
     Merge semantics: skills that exist in the global dir but NOT in the
-    source profile are left alone — this is "push my stuff" not "make
-    global match exactly". Admin can `rm -rf` global skills they no
-    longer want from the file system.
+    pushed set are left alone — this is "push these", not "make global
+    match exactly". Admin can `rm -rf` global skills they no longer want
+    from the file system.
 
     Returns ``{synced: [<category/name or name>, ...], skipped: [...],
     count: N}``. Never raises; per-skill failures are caught + reported.
     """
-    src = _resolve_profile_home_for_name(profile_name) / 'skills'
-    if not src.exists() or not src.is_dir():
-        return {'synced': [], 'skipped': [], 'count': 0}
-    dst_root = ensure_global_skills_dir()
     synced: list[str] = []
     skipped: list[dict] = []
+
+    only_set: set | None = None
+    if only is not None:
+        if not isinstance(only, list):
+            return {'synced': [], 'skipped': [], 'count': 0,
+                    'error': 'only must be a list of skill labels'}
+        only_set = set(s for s in only if isinstance(s, str) and s)
+        if not only_set:
+            return {'synced': [], 'skipped': [], 'count': 0}
+
+    src = _resolve_profile_home_for_name(profile_name) / 'skills'
+    if not src.exists() or not src.is_dir():
+        # Source profile has no skills/ dir. If specific labels were
+        # requested, report them all as not-found so the caller knows
+        # the push silently dropped them.
+        if only_set is not None:
+            for missing in sorted(only_set):
+                skipped.append({'name': missing, 'error': 'not found in source profile'})
+        return {'synced': [], 'skipped': skipped, 'count': 0}
+    dst_root = ensure_global_skills_dir()
+
+    seen_labels: set = set()
 
     for entry in sorted(src.iterdir()):
         if not entry.is_dir():
             continue
         # Direct skill at root: <skills>/<name>/SKILL.md
         if (entry / 'SKILL.md').is_file():
-            _copy_skill(entry, dst_root / entry.name, entry.name, synced, skipped)
+            label = entry.name
+            seen_labels.add(label)
+            if only_set is not None and label not in only_set:
+                continue
+            _copy_skill(entry, dst_root / entry.name, label, synced, skipped)
             continue
         # Category dir: <skills>/<category>/<name>/SKILL.md
         for sub in sorted(entry.iterdir()):
             if not sub.is_dir() or not (sub / 'SKILL.md').is_file():
                 continue
-            rel = f"{entry.name}/{sub.name}"
-            _copy_skill(sub, dst_root / entry.name / sub.name, rel, synced, skipped)
+            label = f"{entry.name}/{sub.name}"
+            seen_labels.add(label)
+            if only_set is not None and label not in only_set:
+                continue
+            _copy_skill(sub, dst_root / entry.name / sub.name, label, synced, skipped)
+
+    # Report any requested labels that didn't exist in the source profile.
+    if only_set is not None:
+        for missing in sorted(only_set - seen_labels):
+            skipped.append({'name': missing, 'error': 'not found in source profile'})
 
     return {'synced': synced, 'skipped': skipped, 'count': len(synced)}
 

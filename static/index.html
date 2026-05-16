@@ -1249,18 +1249,34 @@
               <div id="adminOutputLanguageStatus" style="font-size:11px;color:var(--muted);margin-top:6px;min-height:14px"></div>
             </div>
 
-            <!-- ── 全局技能同步（admin 推送自己的技能给所有用户）─────── -->
+            <!-- ── 全局技能同步（admin 选择技能推给所有用户）─────────── -->
             <div class="settings-field" style="margin-bottom:18px;padding:12px 14px;background:var(--code-bg);border:1px solid var(--border);border-radius:10px">
               <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;margin-bottom:6px">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v6m0 0l-3-3m3 3l3-3M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg>
                 <span>推送技能到全局</span>
               </label>
               <div style="font-size:11px;color:var(--muted);margin-bottom:8px;line-height:1.5">
-                把你（admin）profile 里的所有技能复制到全局共享目录 <code style="font-family:var(--mono,monospace);background:var(--bg,#0e1a33);padding:1px 5px;border-radius:4px">~/.hermes/global/skills/</code>，所有用户立即可见。
-                <b>同名覆盖</b>，<b>不删除</b>全局中你本地没有的技能（合并语义）。
+                选择你（admin）profile 里的技能复制到全局共享目录 <code style="font-family:var(--mono,monospace);background:var(--bg,#0e1a33);padding:1px 5px;border-radius:4px">~/.hermes/global/skills/</code>，所有用户立即可见。<b>同名覆盖</b>；<b>不删除</b>全局中你没勾选的技能（合并语义）。
               </div>
-              <button type="button" class="sm-btn" id="btnSyncSkillsToGlobal" onclick="adminSyncSkillsToGlobal()" style="font-weight:600">
-                推送我的所有技能到全局
+
+              <!-- 工具栏：刷新 / 全选 / 反选 -->
+              <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+                <button type="button" class="sm-btn" onclick="adminLoadSkillsToSync()" title="刷新列表">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                  <span>刷新</span>
+                </button>
+                <button type="button" class="sm-btn" onclick="adminToggleAllSyncSkills(true)" style="font-size:11.5px">全选</button>
+                <button type="button" class="sm-btn" onclick="adminToggleAllSyncSkills(false)" style="font-size:11.5px">取消全选</button>
+                <span id="adminSyncSelectedCount" style="font-size:11px;color:var(--muted);margin-left:auto"></span>
+              </div>
+
+              <!-- 技能 checklist -->
+              <div id="adminSyncSkillsList" style="max-height:240px;overflow-y:auto;background:var(--bg,#0e1a33);border:1px solid var(--border);border-radius:8px;padding:6px;font-size:12.5px">
+                <div style="padding:14px;text-align:center;color:var(--muted);font-size:11.5px">点「刷新」加载</div>
+              </div>
+
+              <button type="button" class="sm-btn" id="btnSyncSkillsToGlobal" onclick="adminSyncSelectedSkills()" disabled style="margin-top:8px;font-weight:600;color:var(--accent);border-color:rgba(124,185,255,.35);width:100%">
+                推送选中的 0 个到全局
               </button>
               <div id="adminSyncSkillsStatus" style="font-size:11px;color:var(--muted);margin-top:6px;min-height:14px"></div>
             </div>
